@@ -1,0 +1,9 @@
+from example_modules.magic_example.magic_aot import Paladin, Sword
+
+hero = Paladin(Sword(sharpness=10))
+
+print("--- DIAMOND SUPER() CASCADE ---")
+hero.take_damage(50)
+
+print("POLYMORPHIC V-TABLE STRIKE ---")
+hero.strike()

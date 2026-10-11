@@ -1,0 +1,1 @@
+from example_modules.magic_example.magic import *

@@ -1,0 +1,9 @@
+from example_modules import Paladin, Sword
+
+hero = Paladin(Sword(sharpness=10))
+
+print("--- DIAMOND SUPER() CASCADE ---")
+hero.take_damage(50)
+
+print("POLYMORPHIC V-TABLE STRIKE ---")
+hero.strike()
