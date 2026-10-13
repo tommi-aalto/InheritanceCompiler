@@ -93,7 +93,7 @@ class MethodSuperSpecializer(ast.NodeTransformer):
             None,
         )
         if next_owner is None:
-            return ast.Constant(value=None)
+            return ast.Constant(value=Ellipsis)
 
         return ast.Call(
             func=ast.Attribute(

@@ -28,7 +28,7 @@ class Bow(Weapon):
         print("Bow fires!")
         return 15
 
-# 2. HIERARCHY TWO: Diamond Inheritance & Dynamic Super() Cascades
+# 2. HIERARCHY TWO: Diamond Inheritance & Dynamic Super() Cascades!
 class Entity:
     def __init__(self):
         print("Entity initialized")

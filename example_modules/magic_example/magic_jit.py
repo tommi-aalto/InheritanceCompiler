@@ -55,11 +55,11 @@ class Weapon:
             return None
 
     def _Sword___init___for_Sword(self, sharpness):
-        None
+        ...
         self.sharpness = sharpness
 
     def _Bow___init___for_Bow(self, range_dist):
-        None
+        ...
         self.range_dist = range_dist
 
     def __init__(self, type_id: int, sharpness=None, range_dist=None):
