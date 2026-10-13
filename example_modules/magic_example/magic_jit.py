@@ -1,6 +1,5 @@
 from numba.experimental import jitclass
 from numba import njit
-from typing import Optional
 TYPE_WEAPON = 0
 TYPE_SWORD = 1
 TYPE_BOW = 2
@@ -24,18 +23,12 @@ class Weapon:
     sharpness: int
     range_dist: int
 
-    def __init__(self, type_id: int, sharpness=None, range_dist=None):
-        self.type_id = type_id
-        self.sharpness = 0
-        self.range_dist = 0
-        self._dispatch_init(sharpness, range_dist)
-
     def _Weapon_attack_for_Weapon(self, target: str) -> int:
         print(f'Base weapon strikes {target}!')
         return 5
 
     def _Sword_attack_for_Sword(self, target: str, bonus_damage: int=0) -> int:
-        print('Sword slashes ! ')
+        print('Sword slashes !')
         base_dmg = self._Weapon_attack_for_Sword(target)
         return base_dmg + self.sharpness + bonus_damage
 
@@ -61,77 +54,78 @@ class Weapon:
         else:
             return None
 
-    def _Sword_init_for_Sword(self, sharpness):
+    def _Sword___init___for_Sword(self, sharpness):
         None
         self.sharpness = sharpness
 
-    def _Bow_init_for_Bow(self, range_dist):
+    def _Bow___init___for_Bow(self, range_dist):
         None
         self.range_dist = range_dist
 
-    def _dispatch_init(self, sharpness=None, range_dist=None):
+    def __init__(self, type_id: int, sharpness=None, range_dist=None):
+        self.type_id = type_id
+        self.range_dist = 0
+        self.sharpness = 0
         if self.type_id == TYPE_SWORD:
-            return self._Sword_init_for_Sword(sharpness if sharpness is not None else 0)
+            assert sharpness is not None
+            return self._Sword___init___for_Sword(sharpness)
         elif self.type_id == TYPE_BOW:
-            return self._Bow_init_for_Bow(range_dist if range_dist is not None else 0)
+            assert range_dist is not None
+            return self._Bow___init___for_Bow(range_dist)
         else:
             return None
 
-@njit
-def Sword(sharpness=None, range_dist=None):
-    return Weapon(TYPE_SWORD, sharpness, range_dist)
+def Sword(sharpness):
+    return Weapon(TYPE_SWORD, sharpness, range_dist=None)
 
-@njit
-def Bow(sharpness=None, range_dist=None):
-    return Weapon(TYPE_BOW, sharpness, range_dist)
+def Bow(range_dist):
+    return Weapon(TYPE_BOW, range_dist, sharpness=None)
 
 @jitclass()
 class Entity:
     type_id: int
-    weapon: Optional[Weapon]
+    weapon: Weapon | None
+
+    def _Entity___init___for_Entity(self):
+        print('Entity initialized')
+
+    def _Physical___init___for_Physical(self):
+        self._Entity___init___for_Physical()
+
+    def _Entity___init___for_Physical(self):
+        print('Entity initialized')
+
+    def _Magical___init___for_Magical(self):
+        self._Entity___init___for_Magical()
+
+    def _Entity___init___for_Magical(self):
+        print('Entity initialized')
+
+    def _Paladin___init___for_Paladin(self, weapon: Weapon):
+        self._Physical___init___for_Paladin()
+        self.weapon = weapon
+
+    def _Physical___init___for_Paladin(self):
+        self._Magical___init___for_Paladin()
+
+    def _Magical___init___for_Paladin(self):
+        self._Entity___init___for_Paladin()
+
+    def _Entity___init___for_Paladin(self):
+        print('Entity initialized')
 
     def __init__(self, type_id: int, weapon: Weapon=None):
         self.type_id = type_id
         self.weapon = None
-        self._dispatch_init(weapon)
-
-    def _Entity_init_for_Entity(self):
-        print('Entity initialized')
-
-    def _Physical_init_for_Physical(self):
-        self._Entity_init_for_Physical()
-
-    def _Entity_init_for_Physical(self):
-        print('Entity initialized')
-
-    def _Magical_init_for_Magical(self):
-        self._Entity_init_for_Magical()
-
-    def _Entity_init_for_Magical(self):
-        print('Entity initialized')
-
-    def _Paladin_init_for_Paladin(self, weapon: Weapon):
-        self._Physical_init_for_Paladin()
-        self.weapon = weapon
-
-    def _Physical_init_for_Paladin(self):
-        self._Magical_init_for_Paladin()
-
-    def _Magical_init_for_Paladin(self):
-        self._Entity_init_for_Paladin()
-
-    def _Entity_init_for_Paladin(self):
-        print('Entity initialized')
-
-    def _dispatch_init(self, weapon: Weapon=None):
         if self.type_id == TYPE_ENTITY:
-            return self._Entity_init_for_Entity()
+            return self._Entity___init___for_Entity()
         elif self.type_id == TYPE_PHYSICAL:
-            return self._Physical_init_for_Physical()
+            return self._Physical___init___for_Physical()
         elif self.type_id == TYPE_MAGICAL:
-            return self._Magical_init_for_Magical()
+            return self._Magical___init___for_Magical()
         elif self.type_id == TYPE_PALADIN:
-            return self._Paladin_init_for_Paladin(weapon)
+            assert weapon is not None
+            return self._Paladin___init___for_Paladin(weapon)
         else:
             return None
 
@@ -139,7 +133,7 @@ class Entity:
         pass
 
     def _Physical_take_damage_for_Physical(self, amount: int) -> None:
-        print('Physical Armor blocks  5')
+        print('Physical Armor blocks 5')
         self._Entity_take_damage_for_Physical(amount - 5)
 
     def _Entity_take_damage_for_Physical(self, amount: int) -> None:
@@ -157,7 +151,7 @@ class Entity:
         self._Physical_take_damage_for_Paladin(amount)
 
     def _Physical_take_damage_for_Paladin(self, amount: int) -> None:
-        print('Physical Armor blocks  5')
+        print('Physical Armor blocks 5')
         self._Magical_take_damage_for_Paladin(amount - 5)
 
     def _Magical_take_damage_for_Paladin(self, amount: int) -> None:
@@ -190,14 +184,11 @@ class Entity:
         else:
             return None
 
-@njit
-def Physical(weapon: Weapon=None):
-    return Entity(TYPE_PHYSICAL, weapon)
+def Physical():
+    return Entity(TYPE_PHYSICAL, weapon=None)
 
-@njit
-def Magical(weapon: Weapon=None):
-    return Entity(TYPE_MAGICAL, weapon)
+def Magical():
+    return Entity(TYPE_MAGICAL, weapon=None)
 
-@njit
-def Paladin(weapon: Weapon=None):
+def Paladin(weapon: Weapon):
     return Entity(TYPE_PALADIN, weapon)

@@ -12,6 +12,9 @@ class IsInstanceTransformer(ast.NodeTransformer):
     """Intercepts `isinstance(obj, Class)` -> `is_instance(obj, TYPE_CLASS)`"""
     def visit_Call(self, node: ast.Call) -> ast.AST:
         self.generic_visit(node)
+        # Find any function call of isinstance(object, Class) or issubclass(Class, Class)
+        # and replace it with is_instance or is_subclass(object, TYPE_CLASS)
+        # These are custom made methods looking up the result in an inheritance table
         if isinstance(node.func, ast.Name) and node.func.id in ('isinstance', 'issubclass'):
             if len(node.args) == 2 and isinstance(node.args[1], ast.Name):
                 target = node.args[1].id
@@ -29,20 +32,27 @@ class IsInstanceTransformer(ast.NodeTransformer):
 # ==============================================================================
 
 class SuperCallRewriter(ast.NodeTransformer):
-    """Rewrites `super().method(args)` -> `self.super_method(TYPE_CALLER, args)`"""
+    """
+    Rewrites `super().method(args)` -> `self.super_method(TYPE_CALLER, args)`
+    Python will insert self to make it self.super_method(self, TYPE_CALLER, args)
+    the super_method will look up the mro to determine who is the parent
+    based on the type of self and the class the super is called from
+    """
     def __init__(self, current_class_name: str):
         self.current_class_name = current_class_name
 
     def visit_Call(self, node: ast.Call) -> ast.AST:
         self.generic_visit(node)
+        # Find all super() calls
         if isinstance(node.func, ast.Attribute) and \
            isinstance(node.func.value, ast.Call) and \
            isinstance(node.func.value.func, ast.Name) and \
            node.func.value.func.id == 'super':
             
             method_name = node.func.attr
-            
-            # Rewrite to: self.super_{method_name}
+
+            # Take the function which was called on super() and rewrite it to be a method of self
+            # with this name schema: self.super_{method_name}
             node.func = ast.Attribute(
                 value=ast.Name(id='self', ctx=ast.Load()),
                 attr=f"super_{method_name}",
@@ -54,46 +64,6 @@ class SuperCallRewriter(ast.NodeTransformer):
             node.args.insert(0, caller_type)
             
         return node
-
-
-class InitSuperSpecializer(ast.NodeTransformer):
-    def __init__(self, concrete_class, owner_class, mro, init_impls):
-        self.concrete_class = concrete_class
-        self.owner_class = owner_class
-        self.mro = mro
-        self.init_impls = init_impls
-
-    def visit_Call(self, node: ast.Call) -> ast.AST:
-        self.generic_visit(node)
-        if not (
-            isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == 'self'
-            and node.func.attr == 'super___init__'
-        ):
-            return node
-
-        next_owner = next(
-            (
-                ancestor
-                for ancestor in self.mro[self.mro.index(self.owner_class) + 1:]
-                if ancestor in self.init_impls
-            ),
-            None,
-        )
-        if next_owner is None:
-            return ast.Constant(value=None)
-
-        args = node.args[1:] if node.args else []
-        return ast.Call(
-            func=ast.Attribute(
-                value=ast.Name(id='self', ctx=ast.Load()),
-                attr=f"_{next_owner}_init_for_{self.concrete_class}",
-                ctx=ast.Load(),
-            ),
-            args=args,
-            keywords=node.keywords,
-        )
 
 
 class MethodSuperSpecializer(ast.NodeTransformer):
@@ -135,9 +105,11 @@ class MethodSuperSpecializer(ast.NodeTransformer):
             keywords=node.keywords,
         )
 
-
 class OptionalUnwrapper(ast.NodeTransformer):
-    """Insert assertions that narrow Optional self attributes before use."""
+    """
+    As we use Type | None for all complex types in the fat struct,
+    we need to make sure that any method which uses these attributes
+    """
 
     def __init__(self):
         self.optional_fields = set()
@@ -145,11 +117,16 @@ class OptionalUnwrapper(ast.NodeTransformer):
     def visit(self, node):
         if isinstance(node, ast.ClassDef):
             return self.visit_ClassDef(node)
+        if isinstance(node, ast.FunctionDef):
+            return self.visit_FunctionDef(node)
         if isinstance(node, ast.stmt):
             return self._visit_statement(node)
         return super().visit(node)
 
     def visit_ClassDef(self, node: ast.ClassDef):
+        '''
+        Collect all optional fields in the class and store them in self.optional_fields
+        '''
         previous_fields = self.optional_fields
         self.optional_fields = {
             item.target.id
@@ -162,7 +139,56 @@ class OptionalUnwrapper(ast.NodeTransformer):
         self.optional_fields = previous_fields
         return node
 
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        if not node.name == '__init__':
+            return self.generic_visit(node)
+        init_body = copy.deepcopy(node.body)
+        new_init_body = []
+
+        # Helper function to recursively process lists of statements (handles nested ifs)
+        def transform_statements(stmts):
+            new_stmts = []
+            for stmt in stmts:
+                
+                # 1. If it's an 'if' statement, recursively process its inner body and orelse blocks
+                if isinstance(stmt, ast.If):
+                    stmt.body = transform_statements(stmt.body)
+                    stmt.orelse = transform_statements(stmt.orelse)
+                    new_stmts.append(stmt)
+                    continue
+                
+                # 2. Check if the statement (Expr or Return) holds a function/method call
+                call_node = None
+                if isinstance(stmt, (ast.Expr, ast.Return)) and isinstance(stmt.value, ast.Call):
+                    call_node = stmt.value
+                
+                # 3. If a call is found, inject assertions BEFORE the statement
+                if call_node:
+                    for arg in call_node.args:
+                        if isinstance(arg, ast.Name):
+                            arg_name = arg.id
+                            new_stmts.append(
+                                ast.Assert(
+                                    test=ast.Compare(
+                                        left=ast.Name(id=arg_name, ctx=ast.Load()),
+                                        ops=[ast.IsNot()],
+                                        comparators=[ast.Constant(value=None)],
+                                    ),
+                                    msg=None,
+                                )
+                            )
+                
+                # Append the original statement itself
+                new_stmts.append(stmt)
+            return new_stmts
+
+        node.body = transform_statements(node.body)
+        return self.generic_visit(node)
+
     def _visit_statement(self, node):
+        '''
+        insert assert self.attr is not None before any method call which uses self.attr
+        '''
         loaded_attributes = []
         method_attributes = set()
         optional_fields = self.optional_fields
@@ -192,6 +218,8 @@ class OptionalUnwrapper(ast.NodeTransformer):
                     loaded_attributes.append(attribute.attr)
                 self.generic_visit(attribute)
 
+        # find all method calls which use attribues which are optional and will be used in this method
+        # so we can assert they are not None before use
         collector = AttributeCollector()
         collector.visit(node)
 
@@ -208,6 +236,9 @@ class OptionalUnwrapper(ast.NodeTransformer):
             elif isinstance(value, ast.AST):
                 setattr(node, field_name, self.visit(value))
 
+        # inject the assert self.attr is Not None before using it in a method call
+        # So that the method does not need to take care of Optional[Type]
+        # but can use Type directly, and numba will not complain about type mismatch
         assertions = [
             ast.Assert(
                 test=ast.Compare(
@@ -231,7 +262,10 @@ class OptionalUnwrapper(ast.NodeTransformer):
 # ==============================================================================
 
 class FlatteningCompiler(ast.NodeTransformer):
-    """Computes MRO, builds the Ancestry Matrix, and assigns TYPE IDs."""
+    """
+    This class takes all inheritance out of the child classes by manually injecting all
+    inherited parent methods into the child class
+    """
     def __init__(self):
         self.class_registry = {}
         self.class_ids = {}
@@ -239,6 +273,9 @@ class FlatteningCompiler(ast.NodeTransformer):
         self.ordered_classes = []
 
     def _c3_merge(self, seqs):
+        """
+        C3 Linearization algorithm for computing the MRO of inherited python classes
+        """
         res = []
         while True:
             seqs = [s for s in seqs if s]
@@ -252,40 +289,63 @@ class FlatteningCompiler(ast.NodeTransformer):
                 if seq[0] == head: del seq[0]
 
     def _compute_mro(self, cls_name: str) -> list:
+        # In case we did not find the class in the registry, we assume it is a base clas
+        # (like object) and return it as the only element in the MRO
         if cls_name not in self.class_registry: return [cls_name, 'object']
+
+        # Retrieve the Class node based on its name
         cls_node = self.class_registry[cls_name]
+
+        #Get the classes it directly inherits from
         bases = [b.id for b in cls_node.bases if isinstance(b, ast.Name)]
+
+        # MRO is the class itself + the merge of the MROs of its bases + the list of bases
         return [cls_name] + self._c3_merge([self._compute_mro(b) for b in bases] + [bases])
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
         for stmt in node.body:
+            # look for all classes in the module
             if isinstance(stmt, ast.ClassDef):
                 self.class_registry[stmt.name] = copy.deepcopy(stmt)
                 self.ordered_classes.append(stmt.name)
+                # and assign class ids based on the order they were found
                 self.class_ids[stmt.name] = len(self.class_ids)
-                
+
+        # Compute the MRO for each class and build the ancestry matrix
         for cls in self.ordered_classes:
             mro = self._compute_mro(cls)
             self.ancestry_matrix.append(tuple((c in mro) for c in self.ordered_classes))
 
         self.generic_visit(node)
-        
+
+        # Generate the module level injected code
+
+        # Generate TYPE_CLASS constants for each class
         injected = [ast.Assign(targets=[ast.Name(id=f"TYPE_{name.upper()}", ctx=ast.Store())], 
                                value=ast.Constant(value=cid)) for name, cid in self.class_ids.items()]
         
+        # Generate the tuple of tuples representing the ancestry matrix
+        # It will look like this:
+        # ((True, False, False), (False, True, False), (False, False, True))
+        # And should be indexed using the TYPE_CLASS constants to determine if a class is a subclass of another
         matrix_ast = ast.Tuple(elts=[ast.Tuple(elts=[ast.Constant(value=v) for v in row], ctx=ast.Load()) 
                                      for row in self.ancestry_matrix], ctx=ast.Load())
         injected.append(ast.Assign(targets=[ast.Name(id="ANCESTRY_TABLE", ctx=ast.Store())], value=matrix_ast))
 
+
+        # Generate the is_instance and is_subclass lookups
         utils = """
 def is_instance(obj, target_id: int) -> bool: return ANCESTRY_TABLE[obj.type_id][target_id]
 def is_subclass(cls_id: int, target_id: int) -> bool: return ANCESTRY_TABLE[cls_id][target_id]
 """
+        # Inject at module level
         injected.extend(ast.parse(utils).body)
         node.body = injected + node.body
         return node
 
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
+        # Remove all bases from the class definition, since we are flattening the hierarchy
+        # and already put all parent functionality into the children
         node.bases = []
         return node
 
@@ -295,12 +355,19 @@ def is_subclass(cls_id: int, target_id: int) -> bool: return ANCESTRY_TABLE[cls_
 # ==============================================================================
 
 class SquashCompiler(ast.NodeTransformer):
+    """
+    To allow for child-to-parent compability (Object owners accepting children instead of their parents)
+    This class will squash the entire inheritance hierarchy into a single "fat struct" class,
+    which will contain all the fields and methods of all the classes in the hierarchy.
+    """
     def __init__(self, flattening_compiler):
         self.fc = flattening_compiler
+        # We need to know the inheritance extracted from the flattening compiler
+        # As the flattening compiler already stripped the inheritance from the classes
         self.bases_map = {name: [b.id for b in node.bases if isinstance(b, ast.Name)] 
                           for name, node in self.fc.class_registry.items()}
         self.mro_map = {name: self.fc._compute_mro(name) for name in self.fc.ordered_classes}
-                # Replace the old self.root_map line with this:
+        # and map the root of each hierarchy to the classes that belong to it:
         self.root_map = {}
         for name, mro in self.mro_map.items():
             for ancestor in reversed(mro):  # Start from oldest ancestor
@@ -308,24 +375,35 @@ class SquashCompiler(ast.NodeTransformer):
                     self.root_map[name] = ancestor
                     break
 
-        
+        # group all children to be squashed into the root of the inheritance tree
         self.squash_groups = collections.defaultdict(list)
         for cls, root in self.root_map.items():
             self.squash_groups[root].append(cls)
 
     def _merge_arguments(self, signatures):
+        """
+        There will be a rule for the user when overwriting parent methods:
+        accept all arguments the parent accepted in this method first, with the same order
+        afterwards, new arguments can be appended
+
+        the root of the tree will have to accept every argument that any child class ever accepts
+        So this method will merge all the arguments of the same method across the hierarchy into a single signature
+        """
         merged = copy.deepcopy(signatures[0])
         merged.args = []
         defaults_by_name = {}
         present_in = collections.defaultdict(set)
 
+        # Loop through all signatures and collect the arguments and defaults
         for signature_index, signature in enumerate(signatures):
+            # The default value will be overwritten by the first signature that has it, and the rest will be ignored
             defaulted_args = signature.args[-len(signature.defaults):] if signature.defaults else []
             defaults_by_name.update(
                 (arg.arg, default)
                 for arg, default in zip(defaulted_args, signature.defaults)
                 if arg.arg not in defaults_by_name
             )
+            # Append all found args to the merged.args if not already present, and track which signature they were found in
             for arg in signature.args:
                 present_in[arg.arg].add(signature_index)
                 if all(existing.arg != arg.arg for existing in merged.args):
@@ -353,6 +431,7 @@ class SquashCompiler(ast.NodeTransformer):
 
     @staticmethod
     def _is_optional_annotation(annotation):
+        # like this -> Optional[int] or this -> int | None
         if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
             return any(isinstance(side, ast.Constant) and side.value is None for side in (annotation.left, annotation.right))
         if isinstance(annotation, ast.Subscript):
@@ -368,19 +447,24 @@ class SquashCompiler(ast.NodeTransformer):
         }
 
     @classmethod
-    def _optional_annotation(cls, annotation):
+    def _optional_annotation(cls, annotation: ast.Name):
         if annotation is None:
             return None
+        # Only make optional if not already optional or assigning a primitive type
         if cls._is_optional_annotation(annotation) or cls._is_primitive_annotation(annotation):
             return annotation
-        return ast.Subscript(
-            value=ast.Name(id='Optional', ctx=ast.Load()),
-            slice=copy.deepcopy(annotation),
-            ctx=ast.Load(),
+        return ast.BinOp(
+            left=ast.Name(id = annotation.id, ctx=ast.Load()),
+            op=ast.BitOr(),
+            right=ast.Constant(value=None),
         )
 
     @staticmethod
     def _initial_value(annotation):
+        """
+        primitives are initialized to 0, '', False, etc.
+        complex types as None
+        """
         if isinstance(annotation, ast.Name):
             primitive_defaults = {
                 'bool': False,
@@ -393,60 +477,6 @@ class SquashCompiler(ast.NodeTransformer):
             if annotation.id in primitive_defaults:
                 return ast.Constant(value=primitive_defaults[annotation.id])
         return ast.Constant(value=None)
-
-    @staticmethod
-    def _init_method_name(owner, concrete_class):
-        return f"_{owner}_init_for_{concrete_class}"
-
-    def _build_init_dispatcher(self, best_args, all_classes, init_impls, property_registry):
-        outer_else = [ast.Return(value=ast.Constant(value=None))]
-
-        for concrete_class in reversed(all_classes):
-            owner = next(
-                (ancestor for ancestor in self.mro_map[concrete_class] if ancestor in init_impls),
-                None,
-            )
-            if owner is None:
-                continue
-            init_args = init_impls[owner].args.args[1:]
-            call_args = []
-            for init_arg in init_args:
-                passed_arg = ast.Name(id=init_arg.arg, ctx=ast.Load())
-                field = property_registry.get(init_arg.arg)
-                annotation = field.annotation if field is not None else init_arg.annotation
-                if self._is_primitive_annotation(annotation):
-                    passed_arg = ast.IfExp(
-                        test=ast.Compare(
-                            left=copy.deepcopy(passed_arg),
-                            ops=[ast.IsNot()],
-                            comparators=[ast.Constant(value=None)],
-                        ),
-                        body=copy.deepcopy(passed_arg),
-                        orelse=self._initial_value(annotation),
-                    )
-                call_args.append(passed_arg)
-            call = ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id='self', ctx=ast.Load()),
-                    attr=self._init_method_name(owner, concrete_class),
-                    ctx=ast.Load(),
-                ),
-                args=call_args,
-                keywords=[],
-            )
-            outer_else = [
-                ast.If(
-                    test=ast.Compare(
-                        left=ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr='type_id', ctx=ast.Load()),
-                        ops=[ast.Eq()],
-                        comparators=[ast.Name(id=f"TYPE_{concrete_class.upper()}", ctx=ast.Load())],
-                    ),
-                    body=[ast.Return(value=call)],
-                    orelse=outer_else,
-                )
-            ]
-
-        return ast.FunctionDef(name='_dispatch_init', args=copy.deepcopy(best_args), body=outer_else, decorator_list=[])
 
     def _call_args_for_signature(self, signature, available_args, property_registry=None):
         argument_values = {arg.arg: ast.Name(id=arg.arg, ctx=ast.Load()) for arg in available_args.args[1:]}
@@ -484,6 +514,9 @@ class SquashCompiler(ast.NodeTransformer):
         return call_args
 
     def _build_method_dispatcher(self, method_name, best_args, all_classes, impls, is_getter, is_setter):
+        """
+        Make an if-elif chain, looking for the correct type_id and calling the respective method
+        """
         outer_else = [ast.Return(value=ast.Constant(value=None))]
         suffix = "_set" if is_setter else ("_get" if is_getter else "")
 
@@ -530,19 +563,24 @@ class SquashCompiler(ast.NodeTransformer):
         )
 
     def visit_Module(self, node: ast.Module) -> ast.Module:
-        new_module_body = [
-            ast.ImportFrom(module='typing', names=[ast.alias(name='Optional')], level=0)
-        ]
+        '''
+        Squash all inheritance trees found into a singe fat-struct like class
+        '''
+        new_module_body = []
         for stmt in node.body:
+            # Anything which is not a class definition can be taken as found
             if not isinstance(stmt, ast.ClassDef):
                 new_module_body.append(stmt)
                 continue
-                
+
+            # Just look at the roots of the inheritance trees, we will find the children in this pass
             cls_name = stmt.name
             root_name = self.root_map.get(cls_name)
             if cls_name != root_name: continue
-                
+
+            # Make a new class based on this root class, which will be the fat struct
             fat_struct = copy.deepcopy(stmt)
+            # Squash all child classes in to the root
             all_classes = self.squash_groups[root_name]
             
             method_registry = collections.defaultdict(dict) 
@@ -552,83 +590,43 @@ class SquashCompiler(ast.NodeTransformer):
             
             # 1. GATHER DATA & NAMESPACE
             for current_cls in all_classes:
+                # This is the child class were looking at
                 child_node = self.fc.class_registry[current_cls]
                 for item in child_node.body:
                     if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                        # We found an annotation assignment
                         property_node = copy.deepcopy(item)
+                        # primitives are taken directly, complex types are made optional (attr: Class | None) so that they can be initialized with None
                         property_node.annotation = self._optional_annotation(property_node.annotation)
                         property_registry[item.target.id] = property_node
                     elif isinstance(item, ast.FunctionDef):
+                        # Parse all functions
+                        # identify properties and setters by their decorators
                         is_getter = any(isinstance(d, ast.Name) and d.id == 'property' for d in item.decorator_list)
                         is_setter = any(isinstance(d, ast.Attribute) and d.attr == 'setter' for d in item.decorator_list)
-                        
+
+                        # mark them accordingly
                         registry_key = f"{item.name}_SET" if is_setter else (f"{item.name}_GET" if is_getter else item.name)
                         if is_getter or is_setter:
                             property_methods.add(registry_key)
                             item.decorator_list = []
-                            
+
+                        # Rewrite super() calls to be self.super_method(TYPE_CALLER, args)
                         rewritten = SuperCallRewriter(current_cls).visit(copy.deepcopy(item))
                         method_registry[registry_key][current_cls] = rewritten
 
-            # 2. BUILD FAT STRUCT PROPERTIES
+            # 2. BUILD FAT STRUCT PROPERTIES (not the @property, but the annotations)
             fat_struct.body = list(property_registry.values())
             
-            # 3. FAT __init__ GENERATION
-            init_impls = method_registry.get('__init__', {})
-            
-            if init_impls:
-                init_best_args = self._merge_arguments([m.args for m in init_impls.values()])
-            else:
-                init_best_args = ast.arguments(posonlyargs=[], args=[ast.arg(arg='self')], kwonlyargs=[], kw_defaults=[], defaults=[])
-
-            fat_init_args = copy.deepcopy(init_best_args)
-            fat_init_args.args.insert(1, ast.arg(arg='type_id', annotation=ast.Name(id='int', ctx=ast.Load())))
-
-            init_body = [ast.Assign(targets=[ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr='type_id', ctx=ast.Store())], 
-                                    value=ast.Name(id='type_id', ctx=ast.Load()))]
-            init_body.extend(
-                ast.Assign(
-                    targets=[ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr=prop_name, ctx=ast.Store())],
-                    value=self._initial_value(property_registry[prop_name].annotation),
-                )
-                for prop_name in property_registry
-                if prop_name != 'type_id'
-            )
-
-            if init_impls:
-                expected_init_args = [a.arg for a in init_best_args.args[1:]]
-                dispatch_call = ast.Call(func=ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr='_dispatch_init', ctx=ast.Load()),
-                                         args=[ast.Name(id=name, ctx=ast.Load()) for name in expected_init_args], keywords=[])
-                init_body.append(ast.Expr(value=dispatch_call))
-            fat_struct.body.append(ast.FunctionDef(name='__init__', args=fat_init_args, body=init_body, decorator_list=[]))
-
             # 4. GENERATE V-TABLES
             for registry_key, impls in method_registry.items():
+                # for properties, we annotated the names so strip them to get the pure name
                 method_name = registry_key.replace('_SET', '').replace('_GET', '')
                 best_args = self._merge_arguments([m.args for m in impls.values()])
+                # but we need to remember if its a property getter or setter
                 is_getter = registry_key.endswith('_GET')
                 is_setter = registry_key.endswith('_SET')
-
-                if method_name == '__init__':
-                    for concrete_class in all_classes:
-                        mro = self.mro_map[concrete_class]
-                        for owner in mro:
-                            if owner not in impls:
-                                continue
-                            specialized = copy.deepcopy(impls[owner])
-                            specialized.name = self._init_method_name(owner, concrete_class)
-                            specialized = InitSuperSpecializer(
-                                concrete_class,
-                                owner,
-                                mro,
-                                impls,
-                            ).visit(specialized)
-                            fat_struct.body.append(specialized)
-
-                    fat_struct.body.append(
-                        self._build_init_dispatcher(best_args, all_classes, impls, property_registry)
-                    )
-                    continue
+                
 
                 suffix = "_set" if is_setter else ("_get" if is_getter else "")
                 for concrete_class in all_classes:
@@ -637,6 +635,8 @@ class SquashCompiler(ast.NodeTransformer):
                         if owner not in impls:
                             continue
                         specialized = copy.deepcopy(impls[owner])
+                        # rewrite all methods to "_Parent_method_for_Child"
+                        # So that they can be explicitly called (after rewriting super by the SuperSpecializer)
                         specialized.name = f"_{owner}_{method_name}{suffix}_for_{concrete_class}"
                         specialized = MethodSuperSpecializer(
                             concrete_class,
@@ -647,25 +647,60 @@ class SquashCompiler(ast.NodeTransformer):
                         ).visit(specialized)
                         fat_struct.body.append(specialized)
 
-                fat_struct.body.append(
-                    self._build_method_dispatcher(
-                        method_name,
-                        best_args,
-                        all_classes,
-                        impls,
-                        is_getter,
-                        is_setter,
-                    )
+                # the original method name will be a dispatcher calling the correct "Class method for Class" method
+                dispatcher:ast.FunctionDef = self._build_method_dispatcher(
+                    method_name,
+                    best_args,
+                    all_classes,
+                    impls,
+                    is_getter,
+                    is_setter,
                 )
-
+                #The init just needs one additional argument "type_id" and to initialize the type id
+                #and all annotations with dummy values
+                if method_name == '__init__':
+                    # insert the new type_id argument
+                    dispatcher.args.args.insert(1, ast.arg(arg='type_id', annotation=ast.Name(id='int', ctx=ast.Load())))
+                    # and in the __init__ body, assign it to self.type_id
+                    fat_init_args = copy.deepcopy(dispatcher.args)
+                    dispatcher.body.insert(0,ast.Assign(targets=[ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr='type_id', ctx=ast.Store())], 
+                                            value=ast.Name(id='type_id', ctx=ast.Load())))
+                    # Initialize all other properties with their default values (0, '', None)
+                    # Taken care of in _initial_value
+                    # But except type_id
+                    for prop_name in property_registry:
+                        if prop_name == 'type_id':
+                            continue
+                        dispatcher.body.insert(1, ast.Assign(
+                                                    targets=[ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr=prop_name, ctx=ast.Store())],
+                                                    value=self._initial_value(property_registry[prop_name].annotation),
+                                                ))
+                
+                fat_struct.body.append(dispatcher)
+            
             new_module_body.append(fat_struct)
             
             # 5. GENERATE FACADES
+            # Make methods for child classes initializing the root like this
+            # def Child(arg1, arg2):
+            # #     return Parent(type_id=TYPE_CHILD, arg1=arg1, arg2=arg2)
             for child_cls in all_classes:
+                # the root does not need one, this is still a class with a proper __init__
                 if child_cls == root_name: continue
-                
-                facade_args = copy.deepcopy(init_best_args)
+
+                #Take the original child class init arguments
+                facade_args = method_registry['__init__'][child_cls].args
+                #without self
                 facade_args.args = [a for a in facade_args.args[1:]]
+                default_args = []
+                for arg in fat_init_args.args:
+                    if not any(arg.arg == facade_arg.arg for facade_arg in facade_args.args)\
+                        and arg.arg not in ('type_id', 'self'):
+                        default_args.append(
+                            ast.keyword(
+                            arg=arg.arg,              # The name of the parameter
+                            value=ast.Constant(value=None)       # The value assigned to it (e.g., None)
+                        ))
                 
                 facade = ast.FunctionDef(
                     name=child_cls, args=facade_args,
@@ -673,7 +708,7 @@ class SquashCompiler(ast.NodeTransformer):
                         func=ast.Name(id=root_name, ctx=ast.Load()),
                         args=[ast.Name(id=f"TYPE_{child_cls.upper()}", ctx=ast.Load())] + \
                              [ast.Name(id=a.arg, ctx=ast.Load()) for a in facade_args.args],
-                        keywords=[]
+                        keywords=default_args
                     ))], decorator_list=[]
                 )
                 new_module_body.append(facade)
@@ -687,13 +722,16 @@ class SquashCompiler(ast.NodeTransformer):
 # ==============================================================================
 
 class JITInjector(ast.NodeTransformer):
+    '''
+    inject the @jitclass or @njit decorators into the generated code, so that the JIT version can be compiled by numba
+    '''
     def visit_Module(self, node: ast.Module) -> ast.Module:
         node.body = ast.parse("from numba.experimental import jitclass\nfrom numba import njit").body + node.body
         self.generic_visit(node)
         return node
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        if node.name in ('is_instance', 'is_subclass') or node.name[0].isupper():
+        if node.name in ('is_instance', 'is_subclass'):
             node.decorator_list.append(ast.Name(id='njit', ctx=ast.Load()))
         return node
 
@@ -709,17 +747,21 @@ def transpile_code(source_code: str):
     tree = IsInstanceTransformer().visit(tree)
     flattening_pass = FlatteningCompiler()
     tree = flattening_pass.visit(tree)
+    #ast.fix_missing_locations(tree)
+    #flat = ast.unparse(tree)
     tree = SquashCompiler(flattening_pass).visit(tree)
     ast.fix_missing_locations(tree)
     
     aot_code = ast.unparse(tree)
-    
+
+    #Jit methods need an additional treatments to assert that instance attributes are not none before being used 
+    #by assert self.attr is not None. Then numba will not treat is as Optional(Type) but as Type and static typing will work
     jit_tree = OptionalUnwrapper().visit(copy.deepcopy(tree))
     jit_tree = JITInjector().visit(jit_tree)
     ast.fix_missing_locations(jit_tree)
     jit_code = ast.unparse(jit_tree)
     
-    return aot_code, jit_code
+    return aot_code, jit_code#, flat
 
 def compile_module(directory_path: str):
     """
@@ -753,6 +795,7 @@ def compile_module(directory_path: str):
         
         aot_path = os.path.join(directory_path, f"{base_name}_aot.py")
         jit_path = os.path.join(directory_path, f"{base_name}_jit.py")
+        #flat_path = os.path.join(directory_path, f"{base_name}_flat.py")
         hash_path = os.path.join(directory_path, f".{base_name}.hash")
         
         with open(source_path, 'r', encoding='utf-8') as f:
@@ -778,9 +821,13 @@ def compile_module(directory_path: str):
             with open(jit_path, 'w', encoding='utf-8') as f:
                 f.write(jit_code)
                 
+           # with open(flat_path, 'w', encoding='utf-8') as f:
+           #     f.write(flat_code)
+
             # Lock the cache only if compilation succeeded
             with open(hash_path, 'w', encoding='utf-8') as f:
                 f.write(current_hash)
                 
         except Exception as e:
             print(f"[Engine] Compilation failed for {filename}: {e}")
+            raise

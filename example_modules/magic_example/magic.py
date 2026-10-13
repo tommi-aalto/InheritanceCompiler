@@ -15,7 +15,7 @@ class Sword(Weapon):
         super().__init__()
         self.sharpness = sharpness
     def attack(self, target: str, bonus_damage: int = 0) -> int:
-        print("Sword slashes ! ")
+        print("Sword slashes !")
         base_dmg = super().attack(target)
         return base_dmg + self.sharpness + bonus_damage
 
@@ -39,7 +39,7 @@ class Physical(Entity):
     def __init__(self):
         super().__init__()
     def take_damage(self, amount: int) -> None:
-        print("Physical Armor blocks  5")
+        print("Physical Armor blocks 5")
         super().take_damage(amount - 5)
 
 class Magical(Entity):
