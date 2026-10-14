@@ -1,0 +1,4 @@
+*.pyc
+/dist
+pyproject.toml
+*.egg-info
