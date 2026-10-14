@@ -360,8 +360,8 @@ class SquashCompiler(ast.NodeTransformer):
     This class will squash the entire inheritance hierarchy into a single "fat struct" class,
     which will contain all the fields and methods of all the classes in the hierarchy.
     """
-    def __init__(self, flattening_compiler):
-        self.fc = flattening_compiler
+    def __init__(self, flattening_compiler: FlatteningCompiler):
+        self.fc: FlatteningCompiler = flattening_compiler
         # We need to know the inheritance extracted from the flattening compiler
         # As the flattening compiler already stripped the inheritance from the classes
         self.bases_map = {name: [b.id for b in node.bases if isinstance(b, ast.Name)] 
@@ -588,6 +588,7 @@ class SquashCompiler(ast.NodeTransformer):
             property_registry = {'type_id': ast.AnnAssign(target=ast.Name(id='type_id', ctx=ast.Store()), 
                                                           annotation=ast.Name(id='int', ctx=ast.Load()), simple=1)}
             
+
             # 1. GATHER DATA & NAMESPACE
             for current_cls in all_classes:
                 # This is the child class were looking at
@@ -688,10 +689,17 @@ class SquashCompiler(ast.NodeTransformer):
                 # the root does not need one, this is still a class with a proper __init__
                 if child_cls == root_name: continue
 
+                facade_args = ast.arguments()
                 #Take the original child class init arguments
-                facade_args = method_registry['__init__'][child_cls].args
-                #without self
-                facade_args.args = [a for a in facade_args.args[1:]]
+                for i in range(0, len(self.mro_map[child_cls])):
+                    try:
+                        facade_args:ast.arguments = method_registry['__init__'][self.mro_map[child_cls][i]].args
+                        break
+                    except KeyError:
+                        #child has no init, take the parents init
+                        continue
+                # if we found an init, strip self from the arguments, else empty arguments
+                facade_args.args = [a for a in facade_args.args[1:]]  if len(facade_args.args) > 0 else []
                 default_args = []
                 for arg in fat_init_args.args:
                     if not any(arg.arg == facade_arg.arg for facade_arg in facade_args.args)\

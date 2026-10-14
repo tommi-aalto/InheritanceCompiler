@@ -20,12 +20,8 @@ class Sword(Weapon):
         return base_dmg + self.sharpness + bonus_damage
 
 class Bow(Weapon):
-    range_dist: int
-    def __init__(self, range_dist):
-        super().__init__()
-        self.range_dist = range_dist
     def attack(self, target: str) -> int:
-        print("Bow fires!")
+        print("Bow fires at ", target, "!")
         return 15
 
 # 2. HIERARCHY TWO: Diamond Inheritance & Dynamic Super() Cascades!
@@ -43,8 +39,6 @@ class Physical(Entity):
         super().take_damage(amount - 5)
 
 class Magical(Entity):
-    def __init__(self):
-        super().__init__()
     def take_damage(self, amount: int) -> None:
         print("Magical Wards block 10")
         super().take_damage(amount - 10)
