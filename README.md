@@ -12,3 +12,13 @@ getattr(), setattr()
 SUPPORTED:
 Inheritance, multiple inheritance, diamond-style inheritance
 super(), isinstance(object, Class), issubclass (object, Class)
+
+`compile_module(package_directory)` scans Python source files throughout the
+package tree, combines them into one compilation unit, and writes
+`_compiled_aot.py` and `_compiled_jit.py` at the package root. Relative imports
+between those source files are removed because their definitions are combined.
+Import compiled classes from the aggregate module, for example:
+
+```python
+from ._compiled_jit import MyClass
+```

@@ -105,9 +105,50 @@ class MethodSuperSpecializer(ast.NodeTransformer):
             keywords=node.keywords,
         )
 
+
+class ClassAnnotationNormalizer(ast.NodeTransformer):
+    def __init__(self, root_map: dict[str, str]):
+        self.root_map = root_map
+
+    def visit_Name(self, node: ast.Name) -> ast.Name:
+        node.id = self.root_map.get(node.id, node.id)
+        return node
+
+
+class ForwardClassAnnotation(ast.NodeTransformer):
+    def __init__(self, class_name: str):
+        self.class_name = class_name
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if node.id == self.class_name:
+            return ast.Constant(value=self.class_name)
+        return node
+
+
+class AOTForwardAnnotation(ast.NodeTransformer):
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
+        normalizer = ForwardClassAnnotation(node.name)
+        for item in node.body:
+            if isinstance(item, ast.AnnAssign):
+                item.annotation = normalizer.visit(item.annotation)
+            elif isinstance(item, ast.FunctionDef):
+                for argument in (
+                    item.args.posonlyargs
+                    + item.args.args
+                    + item.args.kwonlyargs
+                    + ([item.args.vararg] if item.args.vararg else [])
+                    + ([item.args.kwarg] if item.args.kwarg else [])
+                ):
+                    if argument.annotation is not None:
+                        argument.annotation = normalizer.visit(argument.annotation)
+                if item.returns is not None:
+                    item.returns = normalizer.visit(item.returns)
+        return node
+
+
 class OptionalUnwrapper(ast.NodeTransformer):
     """
-    As we use Type | None for all complex types in the fat struct,
+    As we use Optional[Type] for all complex types in the fat struct,
     we need to make sure that any method which uses these attributes
     """
 
@@ -453,10 +494,10 @@ class SquashCompiler(ast.NodeTransformer):
         # Only make optional if not already optional or assigning a primitive type
         if cls._is_optional_annotation(annotation) or cls._is_primitive_annotation(annotation):
             return annotation
-        return ast.BinOp(
-            left=copy.deepcopy(annotation),
-            op=ast.BitOr(),
-            right=ast.Constant(value=None),
+        return ast.Subscript(
+            value=ast.Name(id='Optional', ctx=ast.Load()),
+            slice=copy.deepcopy(annotation),
+            ctx=ast.Load(),
         )
 
     @staticmethod
@@ -568,7 +609,6 @@ class SquashCompiler(ast.NodeTransformer):
         '''
         new_module_body = []
         for stmt in node.body:
-            # Anything which is not a class definition can be taken as found
             if not isinstance(stmt, ast.ClassDef):
                 new_module_body.append(stmt)
                 continue
@@ -597,7 +637,8 @@ class SquashCompiler(ast.NodeTransformer):
                     if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
                         # We found an annotation assignment
                         property_node = copy.deepcopy(item)
-                        # primitives are taken directly, complex types are made optional (attr: Class | None) so that they can be initialized with None
+                        property_node.annotation = self._normalize_annotation(property_node.annotation)
+                        # primitives are taken directly; complex types can be initialized with None
                         property_node.annotation = self._optional_annotation(property_node.annotation)
                         property_registry[item.target.id] = property_node
                     elif isinstance(item, ast.FunctionDef):
@@ -614,6 +655,15 @@ class SquashCompiler(ast.NodeTransformer):
 
                         # Rewrite super() calls to be self.super_method(TYPE_CALLER, args)
                         rewritten = SuperCallRewriter(current_cls).visit(copy.deepcopy(item))
+                        for argument in (
+                            rewritten.args.posonlyargs
+                            + rewritten.args.args
+                            + rewritten.args.kwonlyargs
+                            + ([rewritten.args.vararg] if rewritten.args.vararg else [])
+                            + ([rewritten.args.kwarg] if rewritten.args.kwarg else [])
+                        ):
+                            argument.annotation = self._normalize_annotation(argument.annotation)
+                        rewritten.returns = self._normalize_annotation(rewritten.returns)
                         method_registry[registry_key][current_cls] = rewritten
 
             # 2. BUILD FAT STRUCT PROPERTIES (not the @property, but the annotations)
@@ -725,6 +775,11 @@ class SquashCompiler(ast.NodeTransformer):
         node.body = new_module_body
         return node
 
+    def _normalize_annotation(self, annotation: ast.AST | None) -> ast.AST | None:
+        if annotation is None:
+            return None
+        return ClassAnnotationNormalizer(self.root_map).visit(copy.deepcopy(annotation))
+
 # ==============================================================================
 # PASS 5: JIT INJECTION 
 # ==============================================================================
@@ -734,7 +789,10 @@ class JITInjector(ast.NodeTransformer):
     inject the @jitclass or @njit decorators into the generated code, so that the JIT version can be compiled by numba
     '''
     def visit_Module(self, node: ast.Module) -> ast.Module:
-        node.body = ast.parse("from numba.experimental import jitclass\nfrom numba import njit").body + node.body
+        _insert_module_imports(
+            node,
+            "from typing import Optional\nfrom numba.experimental import jitclass\nfrom numba import njit, deferred_type, optional",
+        )
         self.generic_visit(node)
         return node
 
@@ -743,9 +801,174 @@ class JITInjector(ast.NodeTransformer):
             node.decorator_list.append(ast.Name(id='njit', ctx=ast.Load()))
         return node
 
-    def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
+    def visit_ClassDef(self, node: ast.ClassDef) -> list[ast.stmt]:
+        deferred_name = f"_DEFERRED_TYPE_{node.name.upper()}"
+        uses_deferred_self = False
+        for item in node.body:
+            if not isinstance(item, ast.AnnAssign):
+                continue
+            annotation = item.annotation
+            if (
+                isinstance(annotation, ast.Subscript)
+                and isinstance(annotation.value, ast.Name)
+                and annotation.value.id == 'Optional'
+                and isinstance(annotation.slice, ast.Name)
+                and annotation.slice.id == node.name
+            ):
+                item.annotation = ast.Call(
+                    func=ast.Name(id='optional', ctx=ast.Load()),
+                    args=[ast.Name(id=deferred_name, ctx=ast.Load())],
+                    keywords=[],
+                )
+                uses_deferred_self = True
+
+        class_annotation_normalizer = ForwardClassAnnotation(node.name)
+        for item in node.body:
+            if isinstance(item, ast.FunctionDef):
+                for argument in (
+                    item.args.posonlyargs
+                    + item.args.args
+                    + item.args.kwonlyargs
+                    + ([item.args.vararg] if item.args.vararg else [])
+                    + ([item.args.kwarg] if item.args.kwarg else [])
+                ):
+                    if argument.annotation is not None:
+                        argument.annotation = class_annotation_normalizer.visit(argument.annotation)
+                if item.returns is not None:
+                    item.returns = class_annotation_normalizer.visit(item.returns)
+
         node.decorator_list.append(ast.Call(func=ast.Name(id='jitclass', ctx=ast.Load()), args=[], keywords=[]))
+        if not uses_deferred_self:
+            return [node]
+        return [
+            ast.Assign(
+                targets=[ast.Name(id=deferred_name, ctx=ast.Store())],
+                value=ast.Call(func=ast.Name(id='deferred_type', ctx=ast.Load()), args=[], keywords=[]),
+            ),
+            node,
+            ast.Expr(
+                value=ast.Call(
+                    func=ast.Attribute(
+                        value=ast.Name(id=deferred_name, ctx=ast.Load()),
+                        attr='define',
+                        ctx=ast.Load(),
+                    ),
+                    args=[
+                        ast.Attribute(
+                            value=ast.Attribute(
+                                value=ast.Name(id=node.name, ctx=ast.Load()),
+                                attr='class_type',
+                                ctx=ast.Load(),
+                            ),
+                            attr='instance_type',
+                            ctx=ast.Load(),
+                        )
+                    ],
+                    keywords=[],
+                )
+            ),
+        ]
+
+
+def _insert_module_imports(node: ast.Module, import_source: str) -> None:
+    import_index = 0
+    if (
+        node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+        and isinstance(node.body[0].value.value, str)
+    ):
+        import_index = 1
+    while (
+        import_index < len(node.body)
+        and isinstance(node.body[import_index], ast.ImportFrom)
+        and node.body[import_index].module == '__future__'
+    ):
+        import_index += 1
+    node.body[import_index:import_index] = ast.parse(import_source).body
+
+
+class CompiledImportRewriter(ast.NodeTransformer):
+    def __init__(self, suffix: str):
+        self.suffix = suffix
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> ast.ImportFrom:
+        if node.level > 0 and node.module:
+            module_parts = node.module.rsplit('.', 1)
+            module_parts[-1] += self.suffix
+            node.module = '.'.join(module_parts)
         return node
+
+
+class RelativeImportRemover(ast.NodeTransformer):
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        if node.level > 0:
+            return None
+        return node
+
+
+def _combine_module_sources(module_sources: list[tuple[str, str]]) -> str:
+    parsed_modules = []
+    module_indexes = {}
+    for filename, source_code in module_sources:
+        module_name = os.path.splitext(filename)[0].replace(os.sep, '.')
+        module_indexes[module_name] = len(parsed_modules)
+        parsed_modules.append((module_name, filename, ast.parse(source_code, filename=filename)))
+
+    dependencies = [set() for _ in parsed_modules]
+    for index, (module_name, _, module) in enumerate(parsed_modules):
+        package_parts = module_name.split('.')[:-1]
+        for statement in ast.walk(module):
+            if not isinstance(statement, ast.ImportFrom) or statement.level == 0:
+                continue
+            package_length = len(package_parts) - statement.level + 1
+            if package_length < 0:
+                continue
+            target_parts = package_parts[:package_length]
+            if statement.module:
+                target_parts.extend(statement.module.split('.'))
+                target = '.'.join(target_parts)
+                if target in module_indexes:
+                    dependencies[index].add(module_indexes[target])
+            else:
+                for imported_name in statement.names:
+                    target = '.'.join(target_parts + [imported_name.name])
+                    if target in module_indexes:
+                        dependencies[index].add(module_indexes[target])
+
+    ordered_indexes = []
+    remaining_indexes = set(range(len(parsed_modules)))
+    while remaining_indexes:
+        ready_indexes = sorted(
+            index
+            for index in remaining_indexes
+            if dependencies[index].isdisjoint(remaining_indexes)
+        )
+        if not ready_indexes:
+            ready_indexes = sorted(remaining_indexes)
+        ordered_indexes.extend(ready_indexes)
+        remaining_indexes.difference_update(ready_indexes)
+
+    body = []
+    future_imports = []
+    module_docstring = None
+    for index in ordered_indexes:
+        _, _, module = parsed_modules[index]
+        module = copy.deepcopy(module)
+        if module.body and isinstance(module.body[0], ast.Expr) and isinstance(module.body[0].value, ast.Constant) and isinstance(module.body[0].value.value, str):
+            if module_docstring is None:
+                module_docstring = module.body[0]
+            module.body.pop(0)
+        module = RelativeImportRemover().visit(module)
+        for statement in module.body:
+            if isinstance(statement, ast.ImportFrom) and statement.module == '__future__':
+                future_imports.append(statement)
+            else:
+                body.append(statement)
+
+    combined_body = ([module_docstring] if module_docstring is not None else []) + future_imports + body
+    return ast.unparse(ast.Module(body=combined_body, type_ignores=[]))
+
 
 def transpile_code(source_code: str):
     """Executes the pipeline in memory and returns (AOT_code, JIT_code)"""
@@ -760,11 +983,15 @@ def transpile_code(source_code: str):
     tree = SquashCompiler(flattening_pass).visit(tree)
     ast.fix_missing_locations(tree)
     
-    aot_code = ast.unparse(tree)
+    aot_tree = AOTForwardAnnotation().visit(copy.deepcopy(tree))
+    aot_tree = CompiledImportRewriter('_aot').visit(aot_tree)
+    _insert_module_imports(aot_tree, "from typing import Optional")
+    aot_code = ast.unparse(aot_tree)
 
     #Jit methods need an additional treatments to assert that instance attributes are not none before being used 
     #by assert self.attr is not None. Then numba will not treat is as Optional(Type) but as Type and static typing will work
     jit_tree = OptionalUnwrapper().visit(copy.deepcopy(tree))
+    jit_tree = CompiledImportRewriter('_jit').visit(jit_tree)
     jit_tree = JITInjector().visit(jit_tree)
     ast.fix_missing_locations(jit_tree)
     jit_code = ast.unparse(jit_tree)
@@ -773,8 +1000,8 @@ def transpile_code(source_code: str):
 
 def compile_module(directory_path: str):
     """
-    Scans a directory for OOP Python files, hashes them to detect changes,
-    and dynamically compiles them into _aot.py and _jit.py files.
+    Scans a package tree for OOP Python files, combines them, and dynamically
+    compiles the combined source into _compiled_aot.py and _compiled_jit.py.
     Designed to be called at the top of an __init__.py file.
     """
     print(f"[Engine] Scanning directory for OOP files: {directory_path}")
@@ -784,58 +1011,63 @@ def compile_module(directory_path: str):
     with open(__file__, 'rb') as compiler_file:
         compiler_hash = hashlib.md5(compiler_file.read()).digest()
 
-    for dir in os.listdir(directory_path):
-        dir_path = os.path.join(directory_path, dir)
-        if os.path.isdir(dir_path) and dir != '__pycache__':
-            print(f"[Engine] Recursively compiling submodule: {dir_path}")
-            compile_module(dir_path)  # Recursive call for subdirectories
+    source_paths = []
+    for current_directory, subdirectories, filenames in os.walk(directory_path):
+        subdirectories[:] = sorted(
+            name for name in subdirectories if name != '__pycache__'
+        )
+        for filename in sorted(filenames):
+            if (
+                not filename.endswith('.py')
+                or filename == '__init__.py'
+                or filename.endswith(('_aot.py', '_jit.py'))
+                or filename in ('_compiled_aot.py', '_compiled_jit.py')
+            ):
+                continue
+            source_paths.append(os.path.join(current_directory, filename))
 
-    for filename in os.listdir(directory_path):
-        if not filename.endswith('.py'):
-            continue
-            
-        # Skip special files and previously compiled outputs
-        if filename == '__init__.py' or filename.endswith('_aot.py') or filename.endswith('_jit.py'):
-            continue
-            
-        source_path = os.path.join(directory_path, filename)
-        base_name = filename[:-3]
-        
-        aot_path = os.path.join(directory_path, f"{base_name}_aot.py")
-        jit_path = os.path.join(directory_path, f"{base_name}_jit.py")
-        #flat_path = os.path.join(directory_path, f"{base_name}_flat.py")
-        hash_path = os.path.join(directory_path, f".{base_name}.hash")
-        
-        with open(source_path, 'r', encoding='utf-8') as f:
-            source_code = f.read()
-            
-        current_hash = hashlib.md5(source_code.encode('utf-8') + compiler_hash).hexdigest()
-        
-        # Check cache hit
-        if os.path.exists(hash_path) and os.path.exists(aot_path) and os.path.exists(jit_path):
-            with open(hash_path, 'r', encoding='utf-8') as f:
-                if f.read().strip() == current_hash:
-                    print(f"[Engine] Cache hit for {filename}, skipping compilation.")
-                    continue  # Cache hit, completely skip compilation
-                
-        print(f"[Engine] Compiling {filename} to C-Structs...")
-        
-        try:
-            aot_code, jit_code = transpile_code(source_code)
-            
-            with open(aot_path, 'w', encoding='utf-8') as f:
-                f.write(aot_code)
-                
-            with open(jit_path, 'w', encoding='utf-8') as f:
-                f.write(jit_code)
-                
-           # with open(flat_path, 'w', encoding='utf-8') as f:
-           #     f.write(flat_code)
+    if not source_paths:
+        print("[Engine] No source modules found, skipping compilation.")
+        return
 
-            # Lock the cache only if compilation succeeded
-            with open(hash_path, 'w', encoding='utf-8') as f:
-                f.write(current_hash)
-                
-        except Exception as e:
-            print(f"[Engine] Compilation failed for {filename}: {e}")
-            raise
+    module_sources = []
+    source_hash = hashlib.md5(compiler_hash)
+    for source_path in source_paths:
+        with open(source_path, 'r', encoding='utf-8') as source_file:
+            source_code = source_file.read()
+        relative_path = os.path.relpath(source_path, directory_path)
+        source_hash.update(relative_path.encode('utf-8'))
+        source_hash.update(b'\0')
+        source_hash.update(source_code.encode('utf-8'))
+        source_hash.update(b'\0')
+        module_sources.append((relative_path, source_code))
+
+    aot_path = os.path.join(directory_path, '_compiled_aot.py')
+    jit_path = os.path.join(directory_path, '_compiled_jit.py')
+    hash_path = os.path.join(directory_path, '.compiled.hash')
+    current_hash = source_hash.hexdigest()
+
+    if os.path.exists(hash_path) and os.path.exists(aot_path) and os.path.exists(jit_path):
+        with open(hash_path, 'r', encoding='utf-8') as hash_file:
+            if hash_file.read().strip() == current_hash:
+                print("[Engine] Cache hit for combined modules, skipping compilation.")
+                return
+
+    print(f"[Engine] Compiling {len(module_sources)} source modules into combined output...")
+
+    try:
+        combined_source = _combine_module_sources(module_sources)
+        aot_code, jit_code = transpile_code(combined_source)
+
+        with open(aot_path, 'w', encoding='utf-8') as aot_file:
+            aot_file.write(aot_code)
+
+        with open(jit_path, 'w', encoding='utf-8') as jit_file:
+            jit_file.write(jit_code)
+
+        with open(hash_path, 'w', encoding='utf-8') as hash_file:
+            hash_file.write(current_hash)
+
+    except Exception as error:
+        print(f"[Engine] Combined compilation failed: {error}")
+        raise

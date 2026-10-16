@@ -12,6 +12,6 @@ compile_module(_current_dir)
 #     from .magic_example.magic import Entity, Player
 # else:
 #     # Runtime Execution (reads the auto-generated JIT file)
-from .magic_example.magic_jit import Entity, Physical, Magical, Paladin, Weapon, Sword, Bow
-from .magic_example.magic_jit import is_instance as jit_isinstance, is_instance as jit_issubclass
+from ._compiled_jit import Entity, Physical, Magical, Paladin, Weapon, Sword, Bow
+from ._compiled_jit import is_instance as jit_isinstance, is_instance as jit_issubclass
 __all__ = ["Entity", "Physical", "Magical", "Paladin", "Weapon", "Sword", "Bow", jit_isinstance, jit_issubclass]
