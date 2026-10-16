@@ -10,8 +10,13 @@ NOT SUPPORTED:
 getattr(), setattr()
 
 SUPPORTED:
-Inheritance, multiple inheritance, diamond-style inheritance
+Inheritance, multiple inheritance, diamond-style inheritance, and multiple
+inheritance across otherwise separate root hierarchies
 super(), isinstance(object, Class), issubclass (object, Class)
+
+When a class combines separate inheritance trees, the compiler creates an
+artificial squash root for those trees. Original class MROs are retained when
+specializing `super()` calls, so calls stop at the original roots as before.
 
 `compile_module(package_directory)` scans Python source files throughout the
 package tree, combines them into one compilation unit, and writes

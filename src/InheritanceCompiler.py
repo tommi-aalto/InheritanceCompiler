@@ -115,22 +115,69 @@ class ClassAnnotationNormalizer(ast.NodeTransformer):
         return node
 
 
-class ForwardClassAnnotation(ast.NodeTransformer):
-    def __init__(self, class_name: str):
-        self.class_name = class_name
+class ForwardClassReferences(ast.NodeTransformer):
+    def __init__(self, class_names: set[str]):
+        self.class_names = class_names
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
-        if node.id == self.class_name:
-            return ast.Constant(value=self.class_name)
+        if node.id in self.class_names:
+            return ast.Constant(value=node.id)
         return node
 
 
+class OptionalAnnotationNormalizer(ast.NodeTransformer):
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AnnAssign:
+        node.annotation = self.visit(node.annotation)
+        return node
+
+    def visit_arg(self, node: ast.arg) -> ast.arg:
+        if node.annotation is not None:
+            node.annotation = self.visit(node.annotation)
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        self.generic_visit(node.args)
+        if node.returns is not None:
+            node.returns = self.visit(node.returns)
+        return node
+
+    def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+        if isinstance(node.op, ast.BitOr):
+            if isinstance(node.left, ast.Constant) and node.left.value is None:
+                return ast.Subscript(
+                    value=ast.Name(id='Optional', ctx=ast.Load()),
+                    slice=self.visit(node.right),
+                    ctx=ast.Load(),
+                )
+            if isinstance(node.right, ast.Constant) and node.right.value is None:
+                return ast.Subscript(
+                    value=ast.Name(id='Optional', ctx=ast.Load()),
+                    slice=self.visit(node.left),
+                    ctx=ast.Load(),
+                )
+        return self.generic_visit(node)
+
+
 class AOTForwardAnnotation(ast.NodeTransformer):
+    def __init__(self):
+        self.class_names = set()
+
+    def visit_Module(self, node: ast.Module) -> ast.Module:
+        self.class_names = {
+            statement.name
+            for statement in node.body
+            if isinstance(statement, ast.ClassDef)
+        }
+        self.generic_visit(node)
+        return node
+
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
-        normalizer = ForwardClassAnnotation(node.name)
+        normalizer = ForwardClassReferences(self.class_names)
         for item in node.body:
             if isinstance(item, ast.AnnAssign):
-                item.annotation = normalizer.visit(item.annotation)
+                item.annotation = normalizer.visit(
+                    OptionalAnnotationNormalizer().visit(item.annotation)
+                )
             elif isinstance(item, ast.FunctionDef):
                 for argument in (
                     item.args.posonlyargs
@@ -140,9 +187,33 @@ class AOTForwardAnnotation(ast.NodeTransformer):
                     + ([item.args.kwarg] if item.args.kwarg else [])
                 ):
                     if argument.annotation is not None:
-                        argument.annotation = normalizer.visit(argument.annotation)
+                        argument.annotation = normalizer.visit(
+                            OptionalAnnotationNormalizer().visit(argument.annotation)
+                        )
                 if item.returns is not None:
-                    item.returns = normalizer.visit(item.returns)
+                    item.returns = normalizer.visit(
+                        OptionalAnnotationNormalizer().visit(item.returns)
+                    )
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        normalizer = ForwardClassReferences(self.class_names)
+        for argument in (
+            node.args.posonlyargs
+            + node.args.args
+            + node.args.kwonlyargs
+            + ([node.args.vararg] if node.args.vararg else [])
+            + ([node.args.kwarg] if node.args.kwarg else [])
+        ):
+            if argument.annotation is not None:
+                argument.annotation = normalizer.visit(
+                    OptionalAnnotationNormalizer().visit(argument.annotation)
+                )
+        if node.returns is not None:
+            node.returns = normalizer.visit(
+                OptionalAnnotationNormalizer().visit(node.returns)
+            )
+        node.body = [self.visit(statement) for statement in node.body]
         return node
 
 
@@ -312,6 +383,7 @@ class FlatteningCompiler(ast.NodeTransformer):
         self.class_ids = {}
         self.ancestry_matrix = []
         self.ordered_classes = []
+        self.artificial_root_groups = {}
 
     def _c3_merge(self, seqs):
         """
@@ -343,6 +415,80 @@ class FlatteningCompiler(ast.NodeTransformer):
         # MRO is the class itself + the merge of the MROs of its bases + the list of bases
         return [cls_name] + self._c3_merge([self._compute_mro(b) for b in bases] + [bases])
 
+    def _add_artificial_roots(self) -> list[ast.ClassDef]:
+        def tree_root(cls_name: str) -> str | None:
+            for ancestor in reversed(self._compute_mro(cls_name)):
+                if ancestor in self.class_registry:
+                    return ancestor
+            return None
+
+        parent_roots = {}
+        all_roots = set()
+        for cls_name, cls_node in self.class_registry.items():
+            roots = {
+                root
+                for base in cls_node.bases
+                if isinstance(base, ast.Name)
+                and (root := tree_root(base.id)) is not None
+            }
+            parent_roots[cls_name] = roots
+            all_roots.update(roots)
+
+        parent = {root: root for root in all_roots}
+
+        def find(root: str) -> str:
+            while parent[root] != root:
+                parent[root] = parent[parent[root]]
+                root = parent[root]
+            return root
+
+        def union(first: str, second: str) -> None:
+            first_root = find(first)
+            second_root = find(second)
+            if first_root != second_root:
+                parent[second_root] = first_root
+
+        crossover_roots = set()
+        for roots in parent_roots.values():
+            if len(roots) > 1:
+                roots_in_order = [
+                    name for name in self.ordered_classes if name in roots
+                ]
+                crossover_roots.update(roots_in_order)
+                for root in roots_in_order[1:]:
+                    union(roots_in_order[0], root)
+
+        components = collections.defaultdict(list)
+        for root in self.ordered_classes:
+            if root in crossover_roots:
+                components[find(root)].append(root)
+
+        created = []
+        reserved_names = set(self.class_registry)
+        for roots in components.values():
+            if len(roots) < 2:
+                continue
+            artificial_name = "_ArtificialRoot_" + "_".join(roots)
+            suffix = 2
+            while artificial_name in reserved_names:
+                artificial_name = "_ArtificialRoot_" + "_".join(roots) + f"_{suffix}"
+                suffix += 1
+            reserved_names.add(artificial_name)
+
+            artificial_root = ast.ClassDef(
+                name=artificial_name,
+                bases=[ast.Name(id=root, ctx=ast.Load()) for root in roots],
+                keywords=[],
+                body=[ast.Pass()],
+                decorator_list=[],
+            )
+            self.class_registry[artificial_name] = copy.deepcopy(artificial_root)
+            self.class_ids[artificial_name] = len(self.class_ids)
+            self.ordered_classes.append(artificial_name)
+            self.artificial_root_groups[artificial_name] = roots
+            created.append(artificial_root)
+        return created
+
     def visit_Module(self, node: ast.Module) -> ast.Module:
         for stmt in node.body:
             # look for all classes in the module
@@ -352,11 +498,14 @@ class FlatteningCompiler(ast.NodeTransformer):
                 # and assign class ids based on the order they were found
                 self.class_ids[stmt.name] = len(self.class_ids)
 
+        artificial_roots = self._add_artificial_roots()
+
         # Compute the MRO for each class and build the ancestry matrix
         for cls in self.ordered_classes:
             mro = self._compute_mro(cls)
             self.ancestry_matrix.append(tuple((c in mro) for c in self.ordered_classes))
 
+        node.body.extend(artificial_roots)
         self.generic_visit(node)
 
         # Generate the module level injected code
@@ -415,6 +564,11 @@ class SquashCompiler(ast.NodeTransformer):
                 if ancestor in self.fc.class_registry:
                     self.root_map[name] = ancestor
                     break
+
+        for artificial_root, roots in self.fc.artificial_root_groups.items():
+            for name, mro in self.mro_map.items():
+                if name == artificial_root or any(root in mro for root in roots):
+                    self.root_map[name] = artificial_root
 
         # group all children to be squashed into the root of the inheritance tree
         self.squash_groups = collections.defaultdict(list)
@@ -743,7 +897,9 @@ class SquashCompiler(ast.NodeTransformer):
                 #Take the original child class init arguments
                 for i in range(0, len(self.mro_map[child_cls])):
                     try:
-                        facade_args:ast.arguments = method_registry['__init__'][self.mro_map[child_cls][i]].args
+                        facade_args = copy.deepcopy(
+                            method_registry['__init__'][self.mro_map[child_cls][i]].args
+                        )
                         break
                     except KeyError:
                         #child has no init, take the parents init
@@ -764,9 +920,11 @@ class SquashCompiler(ast.NodeTransformer):
                     name=child_cls, args=facade_args,
                     body=[ast.Return(value=ast.Call(
                         func=ast.Name(id=root_name, ctx=ast.Load()),
-                        args=[ast.Name(id=f"TYPE_{child_cls.upper()}", ctx=ast.Load())] + \
-                             [ast.Name(id=a.arg, ctx=ast.Load()) for a in facade_args.args],
-                        keywords=default_args
+                        args=[ast.Name(id=f"TYPE_{child_cls.upper()}", ctx=ast.Load())],
+                        keywords=[
+                            ast.keyword(arg=arg.arg, value=ast.Name(id=arg.arg, ctx=ast.Load()))
+                            for arg in facade_args.args
+                        ] + default_args,
                     ))], decorator_list=[]
                 )
                 new_module_body.append(facade)
@@ -788,13 +946,45 @@ class JITInjector(ast.NodeTransformer):
     '''
     inject the @jitclass or @njit decorators into the generated code, so that the JIT version can be compiled by numba
     '''
+    def __init__(self):
+        self.compiled_class_names = set()
+
     def visit_Module(self, node: ast.Module) -> ast.Module:
         _insert_module_imports(
             node,
             "from typing import Optional\nfrom numba.experimental import jitclass\nfrom numba import njit, deferred_type, optional",
         )
+        self.compiled_class_names = {
+            statement.name
+            for statement in node.body
+            if isinstance(statement, ast.ClassDef)
+        }
+        import_index = 0
+        if (
+            node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
+        ):
+            import_index = 1
+        while import_index < len(node.body) and isinstance(
+            node.body[import_index], (ast.Import, ast.ImportFrom)
+        ):
+            import_index += 1
+        declarations = [
+            ast.Assign(
+                targets=[ast.Name(id=self._deferred_name(class_name), ctx=ast.Store())],
+                value=ast.Call(func=ast.Name(id='deferred_type', ctx=ast.Load()), args=[], keywords=[]),
+            )
+            for class_name in sorted(self.compiled_class_names)
+        ]
+        node.body[import_index:import_index] = declarations
         self.generic_visit(node)
         return node
+
+    @staticmethod
+    def _deferred_name(class_name: str) -> str:
+        return f"_DEFERRED_TYPE_{class_name.upper()}"
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         if node.name in ('is_instance', 'is_subclass'):
@@ -802,27 +992,35 @@ class JITInjector(ast.NodeTransformer):
         return node
 
     def visit_ClassDef(self, node: ast.ClassDef) -> list[ast.stmt]:
-        deferred_name = f"_DEFERRED_TYPE_{node.name.upper()}"
-        uses_deferred_self = False
         for item in node.body:
             if not isinstance(item, ast.AnnAssign):
                 continue
             annotation = item.annotation
-            if (
+            optional_annotation = (
                 isinstance(annotation, ast.Subscript)
                 and isinstance(annotation.value, ast.Name)
                 and annotation.value.id == 'Optional'
-                and isinstance(annotation.slice, ast.Name)
-                and annotation.slice.id == node.name
+            )
+            annotation_type = annotation.slice if optional_annotation else annotation
+            if (
+                isinstance(annotation_type, ast.Name)
+                and annotation_type.id in self.compiled_class_names
             ):
-                item.annotation = ast.Call(
-                    func=ast.Name(id='optional', ctx=ast.Load()),
-                    args=[ast.Name(id=deferred_name, ctx=ast.Load())],
-                    keywords=[],
+                deferred_type = ast.Name(
+                    id=self._deferred_name(annotation_type.id),
+                    ctx=ast.Load(),
                 )
-                uses_deferred_self = True
+                item.annotation = (
+                    ast.Call(
+                        func=ast.Name(id='optional', ctx=ast.Load()),
+                        args=[deferred_type],
+                        keywords=[],
+                    )
+                    if optional_annotation
+                    else deferred_type
+                )
 
-        class_annotation_normalizer = ForwardClassAnnotation(node.name)
+        class_annotation_normalizer = ForwardClassReferences(self.compiled_class_names)
         for item in node.body:
             if isinstance(item, ast.FunctionDef):
                 for argument in (
@@ -838,18 +1036,12 @@ class JITInjector(ast.NodeTransformer):
                     item.returns = class_annotation_normalizer.visit(item.returns)
 
         node.decorator_list.append(ast.Call(func=ast.Name(id='jitclass', ctx=ast.Load()), args=[], keywords=[]))
-        if not uses_deferred_self:
-            return [node]
         return [
-            ast.Assign(
-                targets=[ast.Name(id=deferred_name, ctx=ast.Store())],
-                value=ast.Call(func=ast.Name(id='deferred_type', ctx=ast.Load()), args=[], keywords=[]),
-            ),
             node,
             ast.Expr(
                 value=ast.Call(
                     func=ast.Attribute(
-                        value=ast.Name(id=deferred_name, ctx=ast.Load()),
+                        value=ast.Name(id=self._deferred_name(node.name), ctx=ast.Load()),
                         attr='define',
                         ctx=ast.Load(),
                     ),
@@ -991,6 +1183,7 @@ def transpile_code(source_code: str):
     #Jit methods need an additional treatments to assert that instance attributes are not none before being used 
     #by assert self.attr is not None. Then numba will not treat is as Optional(Type) but as Type and static typing will work
     jit_tree = OptionalUnwrapper().visit(copy.deepcopy(tree))
+    jit_tree = OptionalAnnotationNormalizer().visit(jit_tree)
     jit_tree = CompiledImportRewriter('_jit').visit(jit_tree)
     jit_tree = JITInjector().visit(jit_tree)
     ast.fix_missing_locations(jit_tree)
