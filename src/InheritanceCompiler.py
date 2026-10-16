@@ -447,14 +447,14 @@ class SquashCompiler(ast.NodeTransformer):
         }
 
     @classmethod
-    def _optional_annotation(cls, annotation: ast.Name):
+    def _optional_annotation(cls, annotation: ast.AST | None):
         if annotation is None:
             return None
         # Only make optional if not already optional or assigning a primitive type
         if cls._is_optional_annotation(annotation) or cls._is_primitive_annotation(annotation):
             return annotation
         return ast.BinOp(
-            left=ast.Name(id = annotation.id, ctx=ast.Load()),
+            left=copy.deepcopy(annotation),
             op=ast.BitOr(),
             right=ast.Constant(value=None),
         )
