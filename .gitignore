@@ -2,3 +2,4 @@
 /dist
 pyproject.toml
 *.egg-info
+.venv/*

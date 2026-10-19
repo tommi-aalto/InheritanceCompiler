@@ -158,6 +158,576 @@ class OptionalAnnotationNormalizer(ast.NodeTransformer):
         return self.generic_visit(node)
 
 
+class ContextInjector(ast.NodeTransformer):
+    def __init__(self, registry_indexes: dict[str, int], complex_fields: dict[str, str]):
+        self.registry_indexes = registry_indexes
+        self.complex_fields = complex_fields
+        self.complex_list_fields: dict[str, str] = {}
+        self.in_class = False
+        self.instance_id_parameters: dict[str, str] = {}
+        self.complex_list_parameters: dict[str, str] = {}
+        self.complex_variables: dict[str, str] = {}
+
+    @staticmethod
+    def _registry_context() -> ast.Name:
+        return ast.Name(id='__registry', ctx=ast.Load())
+
+    def _field_id(self, field_name: str, ctx: ast.expr_context) -> ast.Attribute:
+        return ast.Attribute(
+            value=ast.Name(id='self', ctx=ast.Load()),
+            attr=f'{field_name}_id',
+            ctx=ctx,
+        )
+
+    def _registry_lookup(self, field_name: str) -> ast.Subscript:
+        target_root = self.complex_fields[field_name]
+        registry = ast.Subscript(
+            value=self._registry_context(),
+            slice=ast.Constant(value=self.registry_indexes[target_root]),
+            ctx=ast.Load(),
+        )
+        return ast.Subscript(
+            value=registry,
+            slice=self._field_id(field_name, ast.Load()),
+            ctx=ast.Load(),
+        )
+
+    @staticmethod
+    def _is_none(node: ast.AST) -> bool:
+        return isinstance(node, ast.Constant) and node.value is None
+
+    def _annotation_registry_root(self, annotation: ast.AST | None) -> str | None:
+        while True:
+            if isinstance(annotation, ast.Subscript) and (
+                isinstance(annotation.value, ast.Name)
+                and annotation.value.id == 'Optional'
+                or isinstance(annotation.value, ast.Attribute)
+                and annotation.value.attr == 'Optional'
+            ):
+                annotation = annotation.slice
+                continue
+            if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+                if self._is_none(annotation.left):
+                    annotation = annotation.right
+                    continue
+                if self._is_none(annotation.right):
+                    annotation = annotation.left
+                    continue
+            break
+        if isinstance(annotation, ast.Name) and annotation.id in self.registry_indexes:
+            return annotation.id
+        return None
+
+    def _annotation_list_registry_root(self, annotation: ast.AST | None) -> str | None:
+        allows_none = self._annotation_allows_none(annotation)
+        while True:
+            if isinstance(annotation, ast.Subscript) and (
+                isinstance(annotation.value, ast.Name)
+                and annotation.value.id == 'Optional'
+                or isinstance(annotation.value, ast.Attribute)
+                and annotation.value.attr == 'Optional'
+            ):
+                annotation = annotation.slice
+                continue
+            if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+                if self._is_none(annotation.left):
+                    annotation = annotation.right
+                    continue
+                if self._is_none(annotation.right):
+                    annotation = annotation.left
+                    continue
+            break
+        if not isinstance(annotation, ast.Subscript):
+            return None
+        list_type = annotation.value
+        is_list = (
+            isinstance(list_type, ast.Name)
+            and list_type.id in ('List', 'list')
+        ) or (
+            isinstance(list_type, ast.Attribute)
+            and list_type.attr in ('List', 'list')
+        )
+        if not is_list:
+            return None
+        if allows_none or self._annotation_allows_none(annotation.slice):
+            raise ValueError(
+                "Optional lists of user-defined classes are not supported; "
+                "use a non-optional list and pass an empty list instead."
+            )
+        return self._annotation_registry_root(annotation.slice)
+
+    @staticmethod
+    def _annotation_allows_none(annotation: ast.AST | None) -> bool:
+        if isinstance(annotation, ast.Subscript) and (
+            isinstance(annotation.value, ast.Name)
+            and annotation.value.id == 'Optional'
+            or isinstance(annotation.value, ast.Attribute)
+            and annotation.value.attr == 'Optional'
+        ):
+            return True
+        return (
+            isinstance(annotation, ast.BinOp)
+            and isinstance(annotation.op, ast.BitOr)
+            and (
+                ContextInjector._is_none(annotation.left)
+                or ContextInjector._is_none(annotation.right)
+            )
+        )
+
+    def _as_instance_id(self, value: ast.expr) -> ast.expr:
+        if self._is_none(value):
+            return ast.Constant(value=-1)
+        if (
+            isinstance(value, ast.Name)
+            and (
+                value.id in self.instance_id_parameters
+                or value.id in self.complex_variables
+            )
+        ):
+            return value
+        if (
+            isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and value.value.id == 'self'
+            and value.attr in self.complex_fields
+        ):
+            return self._field_id(value.attr, ast.Load())
+        return ast.IfExp(
+            test=ast.Compare(
+                left=copy.deepcopy(value),
+                ops=[ast.Is()],
+                comparators=[ast.Constant(value=None)],
+            ),
+            body=ast.Constant(value=-1),
+            orelse=ast.Attribute(value=value, attr='instance_id', ctx=ast.Load()),
+        )
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
+        previous_fields = self.complex_fields
+        previous_list_fields = self.complex_list_fields
+        self.complex_fields = getattr(node, '_complex_fields', previous_fields)
+        self.complex_list_fields = getattr(node, '_complex_list_fields', previous_list_fields)
+        previous_in_class = self.in_class
+        self.in_class = True
+        node.body = [self.visit(statement) for statement in node.body]
+        self.in_class = previous_in_class
+        self.complex_fields = previous_fields
+        self.complex_list_fields = previous_list_fields
+        return node
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        if not self.in_class:
+            return self.generic_visit(node)
+        previous_id_parameters = self.instance_id_parameters
+        previous_list_parameters = self.complex_list_parameters
+        previous_complex_variables = self.complex_variables
+        if node.name == '__init__' or '___init___for_' in node.name:
+            arguments = (
+                node.args.posonlyargs
+                + node.args.args
+                + node.args.kwonlyargs
+                + ([node.args.vararg] if node.args.vararg else [])
+                + ([node.args.kwarg] if node.args.kwarg else [])
+            )
+            self.instance_id_parameters = {
+                argument.arg: root
+                for argument in arguments
+                if (
+                    root := self._annotation_registry_root(argument.annotation)
+                ) is not None
+            }
+            self.complex_list_parameters = {
+                argument.arg: root
+                for argument in arguments
+                if (
+                    root := self._annotation_list_registry_root(argument.annotation)
+                ) is not None
+            }
+            for argument in arguments:
+                if argument.arg in self.instance_id_parameters:
+                    argument.annotation = ast.Attribute(
+                        value=ast.Name(id='types', ctx=ast.Load()),
+                        attr='int64',
+                        ctx=ast.Load(),
+                    )
+                elif argument.arg in self.complex_list_parameters:
+                    argument.annotation = ast.Subscript(
+                        value=ast.Name(id='List', ctx=ast.Load()),
+                        slice=ast.Attribute(
+                            value=ast.Name(id='types', ctx=ast.Load()),
+                            attr='int64',
+                            ctx=ast.Load(),
+                        ),
+                        ctx=ast.Load(),
+                    )
+            positional = node.args.posonlyargs + node.args.args
+            first_default = len(positional) - len(node.args.defaults)
+            for index, default in enumerate(node.args.defaults):
+                argument = positional[first_default + index]
+                if argument.arg in self.instance_id_parameters and self._is_none(default):
+                    node.args.defaults[index] = ast.Constant(value=-1)
+            for index, default in enumerate(node.args.kw_defaults):
+                argument = node.args.kwonlyargs[index]
+                if argument.arg in self.instance_id_parameters and self._is_none(default):
+                    node.args.kw_defaults[index] = ast.Constant(value=-1)
+        if node.args.args and node.args.args[0].arg == 'self':
+            if not any(argument.arg == '__registry' for argument in node.args.args):
+                node.args.args.insert(1, ast.arg(arg='__registry'))
+        node.body = [self.visit(statement) for statement in node.body]
+        self.instance_id_parameters = previous_id_parameters
+        self.complex_list_parameters = previous_list_parameters
+        self.complex_variables = previous_complex_variables
+        return node
+
+    def visit_IfExp(self, node: ast.IfExp) -> ast.expr:
+        if not self.in_class:
+            return self.generic_visit(node)
+        node.test = self.visit(node.test)
+        node.body = self.visit(node.body)
+        node.orelse = self.visit(node.orelse)
+        if (
+            isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id in self.complex_list_parameters
+            and any(self._is_none(comparator) for comparator in node.test.comparators)
+        ):
+            return node.body
+        if (
+            isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id in self.instance_id_parameters
+            and any(
+                self._is_none(comparator)
+                or isinstance(comparator, ast.Constant) and comparator.value == -1
+                for comparator in node.test.comparators
+            )
+        ):
+            node.test.comparators = [
+                ast.Constant(value=-1) if self._is_none(comparator) else comparator
+                for comparator in node.test.comparators
+            ]
+            node.test.ops = [
+                ast.Eq() if isinstance(operator, ast.Is) else
+                ast.NotEq() if isinstance(operator, ast.IsNot) else operator
+                for operator in node.test.ops
+            ]
+            if self._is_none(node.body):
+                node.body = ast.Constant(value=-1)
+            if self._is_none(node.orelse):
+                node.orelse = ast.Constant(value=-1)
+        return node
+
+    def visit_Assign(self, node: ast.Assign) -> ast.Assign:
+        if not self.in_class:
+            return self.generic_visit(node)
+        complex_list_field = next(
+            (
+                target
+                for target in node.targets
+                if isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == 'self'
+                and target.attr in self.complex_list_fields
+            ),
+            None,
+        )
+        if complex_list_field is not None:
+            node.value = self.visit(node.value)
+            node.targets = [
+                ast.Attribute(
+                    value=ast.Name(id='self', ctx=ast.Load()),
+                    attr=f'{target.attr}_ids',
+                    ctx=ast.Store(),
+                )
+                if isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == 'self'
+                and target.attr in self.complex_list_fields
+                else self.visit(target)
+                for target in node.targets
+            ]
+            if isinstance(node.value, ast.Name) and node.value.id in self.complex_list_parameters:
+                return node
+            return node
+        list_element_target = next(
+            (
+                target
+                for target in node.targets
+                if self._complex_list_subscript(target) is not None
+            ),
+            None,
+        )
+        if list_element_target is not None:
+            node.value = self._as_instance_id(self.visit(node.value))
+            node.targets = [self.visit(target) for target in node.targets]
+            return node
+        complex_target = next(
+            (
+                target
+                for target in node.targets
+                if isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == 'self'
+                and target.attr in self.complex_fields
+            ),
+            None,
+        )
+        if complex_target is not None:
+            original_value = node.value
+            node.value = self.visit(original_value)
+            node.targets = [
+                self._field_id(target.attr, ast.Store())
+                if isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == 'self'
+                and target.attr in self.complex_fields
+                else self.visit(target)
+                for target in node.targets
+            ]
+            node.value = self._as_instance_id(
+                original_value
+                if isinstance(original_value, ast.Attribute)
+                and isinstance(original_value.value, ast.Name)
+                and original_value.value.id == 'self'
+                and original_value.attr in self.complex_fields
+                else node.value
+            )
+        else:
+            node.value = self.visit(node.value)
+            node.targets = [self.visit(target) for target in node.targets]
+        return node
+
+    def _complex_list_subscript(self, node: ast.AST) -> ast.Subscript | None:
+        if not isinstance(node, ast.Subscript):
+            return None
+        value = node.value
+        if (
+            isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and value.value.id == 'self'
+            and value.attr in self.complex_list_fields
+        ):
+            return node
+        return None
+
+    def visit_Subscript(self, node: ast.Subscript) -> ast.AST:
+        list_access = self._complex_list_subscript(node)
+        if list_access is None:
+            return self.generic_visit(node)
+        field_name = list_access.value.attr
+        storage = ast.Attribute(
+            value=ast.Name(id='self', ctx=ast.Load()),
+            attr=f'{field_name}_ids',
+            ctx=ast.Load(),
+        )
+        element_id = ast.Subscript(
+            value=storage,
+            slice=self.visit(list_access.slice),
+            ctx=ast.Load(),
+        )
+        if isinstance(node.ctx, ast.Store):
+            element_id.ctx = ast.Store()
+            return element_id
+        registry = ast.Subscript(
+            value=self._registry_context(),
+            slice=ast.Constant(value=self.registry_indexes[self.complex_list_fields[field_name]]),
+            ctx=ast.Load(),
+        )
+        return ast.Subscript(value=registry, slice=element_id, ctx=ast.Load())
+
+    def visit_For(self, node: ast.For) -> ast.For:
+        list_root = None
+        if (
+            isinstance(node.iter, ast.Attribute)
+            and isinstance(node.iter.value, ast.Name)
+            and node.iter.value.id == 'self'
+        ):
+            list_root = self.complex_list_fields.get(node.iter.attr)
+        elif isinstance(node.iter, ast.Name):
+            list_root = self.complex_list_parameters.get(node.iter.id)
+        node.iter = self.visit(node.iter)
+        node.target = self.visit(node.target)
+        if list_root is not None and isinstance(node.target, ast.Name):
+            previous_root = self.complex_variables.get(node.target.id)
+            self.complex_variables[node.target.id] = list_root
+            node.body = [self.visit(statement) for statement in node.body]
+            node.orelse = [self.visit(statement) for statement in node.orelse]
+            if previous_root is None:
+                self.complex_variables.pop(node.target.id, None)
+            else:
+                self.complex_variables[node.target.id] = previous_root
+        else:
+            node.body = [self.visit(statement) for statement in node.body]
+            node.orelse = [self.visit(statement) for statement in node.orelse]
+        return node
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AnnAssign:
+        if not self.in_class:
+            return self.generic_visit(node)
+        if (
+            isinstance(node.target, ast.Attribute)
+            and isinstance(node.target.value, ast.Name)
+            and node.target.value.id == 'self'
+            and node.target.attr in self.complex_fields
+        ):
+            field_name = node.target.attr
+            target = self._field_id(field_name, ast.Store())
+            if node.value is not None:
+                node.value = self.visit(node.value)
+                node.value = self._as_instance_id(node.value)
+                return ast.copy_location(
+                    ast.Assign(targets=[target], value=node.value),
+                    node,
+                )
+            return ast.copy_location(
+                ast.Assign(targets=[target], value=ast.Constant(value=-1)),
+                node,
+            )
+        return self.generic_visit(node)
+
+    def visit_Compare(self, node: ast.Compare) -> ast.Compare:
+        if not self.in_class:
+            return self.generic_visit(node)
+        is_complex_field = (
+            isinstance(node.left, ast.Attribute)
+            and isinstance(node.left.value, ast.Name)
+            and node.left.value.id == 'self'
+            and node.left.attr in self.complex_fields
+        )
+        if is_complex_field:
+            field_name = node.left.attr
+            node.left = self._field_id(field_name, ast.Load())
+            for index, comparator in enumerate(node.comparators):
+                if self._is_none(comparator):
+                    node.comparators[index] = ast.Constant(value=-1)
+            node.ops = [
+                ast.Eq() if isinstance(operator, ast.Is) else
+                ast.NotEq() if isinstance(operator, ast.IsNot) else operator
+                for operator in node.ops
+            ]
+            return self.generic_visit(node)
+        if isinstance(node.left, ast.Name) and node.left.id in self.instance_id_parameters:
+            node.comparators = [
+                ast.Constant(value=-1) if self._is_none(comparator) else self.visit(comparator)
+                for comparator in node.comparators
+            ]
+            node.ops = [
+                ast.Eq() if isinstance(operator, ast.Is) else
+                ast.NotEq() if isinstance(operator, ast.IsNot) else operator
+                for operator in node.ops
+            ]
+            return node
+        return self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> ast.Call:
+        if not self.in_class:
+            return self.generic_visit(node)
+        is_instance_call = (
+            isinstance(node.func, ast.Name)
+            and node.func.id == 'is_instance'
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in self.instance_id_parameters
+        )
+        instance_argument_root = (
+            self.instance_id_parameters[node.args[0].id]
+            if is_instance_call else None
+        )
+        original_receiver = (
+            node.func.value if isinstance(node.func, ast.Attribute) else None
+        )
+        is_self_method = (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == 'self'
+        )
+        is_complex_method = (
+            (
+                isinstance(original_receiver, ast.Attribute)
+                and isinstance(original_receiver.value, ast.Name)
+                and original_receiver.value.id == 'self'
+                and original_receiver.attr in self.complex_fields
+            )
+            or (
+                isinstance(original_receiver, ast.Subscript)
+                and self._complex_list_subscript(original_receiver) is not None
+            )
+            or (
+                isinstance(original_receiver, ast.Name)
+                and original_receiver.id in self.complex_variables
+            )
+        )
+        is_list_append = (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == 'append'
+            and isinstance(original_receiver, ast.Attribute)
+            and isinstance(original_receiver.value, ast.Name)
+            and original_receiver.value.id == 'self'
+            and original_receiver.attr in self.complex_list_fields
+        )
+        node.func = self.visit(node.func)
+        node.args = [self.visit(argument) for argument in node.args]
+        node.keywords = [self.visit(keyword) for keyword in node.keywords]
+        if is_instance_call and instance_argument_root is not None:
+            node.args[0] = ast.Subscript(
+                value=ast.Subscript(
+                    value=self._registry_context(),
+                    slice=ast.Constant(
+                        value=self.registry_indexes[instance_argument_root]
+                    ),
+                    ctx=ast.Load(),
+                ),
+                slice=ast.Name(id=node.args[0].id, ctx=ast.Load()),
+                ctx=ast.Load(),
+            )
+        if is_list_append and node.args:
+            node.args[0] = self._as_instance_id(node.args[0])
+        if is_self_method or is_complex_method:
+            node.args.insert(0, self._registry_context())
+        return node
+
+    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+        if (
+            self.in_class
+            and isinstance(node.value, ast.Name)
+            and node.value.id == 'self'
+            and node.attr in self.complex_list_fields
+        ):
+            return ast.Attribute(
+                value=ast.Name(id='self', ctx=ast.Load()),
+                attr=f'{node.attr}_ids',
+                ctx=node.ctx,
+            )
+        if (
+            self.in_class
+            and isinstance(node.value, ast.Name)
+            and node.value.id == 'self'
+            and node.attr in self.complex_fields
+        ):
+            if isinstance(node.ctx, ast.Store):
+                return self._field_id(node.attr, ast.Store())
+            return self._registry_lookup(node.attr)
+        if (
+            self.in_class
+            and isinstance(node.value, ast.Name)
+            and node.value.id in self.complex_variables
+        ):
+            registry = ast.Subscript(
+                value=self._registry_context(),
+                slice=ast.Constant(
+                    value=self.registry_indexes[self.complex_variables[node.value.id]]
+                ),
+                ctx=ast.Load(),
+            )
+            instance = ast.Subscript(
+                value=registry,
+                slice=ast.Name(id=node.value.id, ctx=ast.Load()),
+                ctx=ast.Load(),
+            )
+            return ast.Attribute(value=instance, attr=node.attr, ctx=node.ctx)
+        return self.generic_visit(node)
+
+
 class AOTForwardAnnotation(ast.NodeTransformer):
     def __init__(self):
         self.class_names = set()
@@ -268,27 +838,6 @@ class OptionalUnwrapper(ast.NodeTransformer):
                     stmt.orelse = transform_statements(stmt.orelse)
                     new_stmts.append(stmt)
                     continue
-                
-                # 2. Check if the statement (Expr or Return) holds a function/method call
-                call_node = None
-                if isinstance(stmt, (ast.Expr, ast.Return)) and isinstance(stmt.value, ast.Call):
-                    call_node = stmt.value
-                
-                # 3. If a call is found, inject assertions BEFORE the statement
-                if call_node:
-                    for arg in call_node.args:
-                        if isinstance(arg, ast.Name):
-                            arg_name = arg.id
-                            new_stmts.append(
-                                ast.Assert(
-                                    test=ast.Compare(
-                                        left=ast.Name(id=arg_name, ctx=ast.Load()),
-                                        ops=[ast.IsNot()],
-                                        comparators=[ast.Constant(value=None)],
-                                    ),
-                                    msg=None,
-                                )
-                            )
                 
                 # Append the original statement itself
                 new_stmts.append(stmt)
@@ -641,6 +1190,65 @@ class SquashCompiler(ast.NodeTransformer):
             'bool', 'bytes', 'complex', 'float', 'int', 'str',
         }
 
+    def _complex_annotation_root(self, annotation: ast.AST | None) -> str | None:
+        while True:
+            if (
+                isinstance(annotation, ast.Subscript)
+                and isinstance(annotation.value, ast.Name)
+                and annotation.value.id == 'Optional'
+            ):
+                annotation = annotation.slice
+                continue
+            if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+                if isinstance(annotation.left, ast.Constant) and annotation.left.value is None:
+                    annotation = annotation.right
+                    continue
+                if isinstance(annotation.right, ast.Constant) and annotation.right.value is None:
+                    annotation = annotation.left
+                    continue
+            break
+        if isinstance(annotation, ast.Name):
+            return self.root_map.get(annotation.id)
+        return None
+
+    def _complex_list_annotation_root(self, annotation: ast.AST | None) -> str | None:
+        allows_none = self._is_optional_annotation(annotation)
+        while True:
+            if isinstance(annotation, ast.Subscript) and (
+                isinstance(annotation.value, ast.Name)
+                and annotation.value.id == 'Optional'
+                or isinstance(annotation.value, ast.Attribute)
+                and annotation.value.attr == 'Optional'
+            ):
+                annotation = annotation.slice
+                continue
+            if isinstance(annotation, ast.BinOp) and isinstance(annotation.op, ast.BitOr):
+                if isinstance(annotation.left, ast.Constant) and annotation.left.value is None:
+                    annotation = annotation.right
+                    continue
+                if isinstance(annotation.right, ast.Constant) and annotation.right.value is None:
+                    annotation = annotation.left
+                    continue
+            break
+        if not isinstance(annotation, ast.Subscript):
+            return None
+        list_type = annotation.value
+        is_list = (
+            isinstance(list_type, ast.Name)
+            and list_type.id in ('List', 'list')
+        ) or (
+            isinstance(list_type, ast.Attribute)
+            and list_type.attr in ('List', 'list')
+        )
+        if not is_list:
+            return None
+        if allows_none or self._is_optional_annotation(annotation.slice):
+            raise ValueError(
+                "Optional lists of user-defined classes are not supported; "
+                "use a non-optional list and pass an empty list instead."
+            )
+        return self._complex_annotation_root(annotation.slice)
+
     @classmethod
     def _optional_annotation(cls, annotation: ast.AST | None):
         if annotation is None:
@@ -757,6 +1365,18 @@ class SquashCompiler(ast.NodeTransformer):
             decorator_list=decorator_list,
         )
 
+    @staticmethod
+    def _complex_field_spec(field_name):
+        return ast.AnnAssign(
+            target=ast.Name(id=f'{field_name}_id', ctx=ast.Store()),
+            annotation=ast.Attribute(
+                value=ast.Name(id='types', ctx=ast.Load()),
+                attr='int64',
+                ctx=ast.Load(),
+            ),
+            simple=1,
+        )
+
     def visit_Module(self, node: ast.Module) -> ast.Module:
         '''
         Squash all inheritance trees found into a singe fat-struct like class
@@ -779,8 +1399,28 @@ class SquashCompiler(ast.NodeTransformer):
             
             method_registry = collections.defaultdict(dict) 
             property_methods = set()
-            property_registry = {'type_id': ast.AnnAssign(target=ast.Name(id='type_id', ctx=ast.Store()), 
-                                                          annotation=ast.Name(id='int', ctx=ast.Load()), simple=1)}
+            property_registry = {
+                'type_id': ast.AnnAssign(
+                    target=ast.Name(id='type_id', ctx=ast.Store()),
+                    annotation=ast.Attribute(
+                        value=ast.Name(id='types', ctx=ast.Load()),
+                        attr='int64',
+                        ctx=ast.Load(),
+                    ),
+                    simple=1,
+                ),
+                'instance_id': ast.AnnAssign(
+                    target=ast.Name(id='instance_id', ctx=ast.Store()),
+                    annotation=ast.Attribute(
+                        value=ast.Name(id='types', ctx=ast.Load()),
+                        attr='int64',
+                        ctx=ast.Load(),
+                    ),
+                    simple=1,
+                ),
+            }
+            complex_fields = {}
+            complex_list_fields = {}
             
 
             # 1. GATHER DATA & NAMESPACE
@@ -792,10 +1432,103 @@ class SquashCompiler(ast.NodeTransformer):
                         # We found an annotation assignment
                         property_node = copy.deepcopy(item)
                         property_node.annotation = self._normalize_annotation(property_node.annotation)
-                        # primitives are taken directly; complex types can be initialized with None
-                        property_node.annotation = self._optional_annotation(property_node.annotation)
-                        property_registry[item.target.id] = property_node
+                        field_name = item.target.id
+                        target_root = self._complex_annotation_root(property_node.annotation)
+                        list_root = self._complex_list_annotation_root(property_node.annotation)
+                        if target_root is not None:
+                            previous_root = complex_fields.get(field_name)
+                            if previous_root is not None and previous_root != target_root:
+                                raise ValueError(
+                                    f"Conflicting complex types for field {field_name!r}: "
+                                    f"{previous_root!r} and {target_root!r}"
+                                )
+                            complex_fields[field_name] = target_root
+                            property_node.target.id = f'{field_name}_id'
+                            property_node.annotation = ast.Attribute(
+                                value=ast.Name(id='types', ctx=ast.Load()),
+                                attr='int64',
+                                ctx=ast.Load(),
+                            )
+                        elif list_root is not None:
+                            previous_root = complex_list_fields.get(field_name)
+                            if previous_root is not None and previous_root != list_root:
+                                raise ValueError(
+                                    f"Conflicting complex list types for field {field_name!r}: "
+                                    f"{previous_root!r} and {list_root!r}"
+                                )
+                            complex_list_fields[field_name] = list_root
+                            property_node.target.id = f'{field_name}_ids'
+                            property_node.annotation = ast.Subscript(
+                                value=ast.Name(id='List', ctx=ast.Load()),
+                                slice=ast.Attribute(
+                                    value=ast.Name(id='types', ctx=ast.Load()),
+                                    attr='int64',
+                                    ctx=ast.Load(),
+                                ),
+                                ctx=ast.Load(),
+                            )
+                        else:
+                            # primitives are direct fields; other non-class references keep Optional storage.
+                            property_node.annotation = self._optional_annotation(property_node.annotation)
+                        property_registry[property_node.target.id] = property_node
                     elif isinstance(item, ast.FunctionDef):
+                        argument_roots = {
+                            argument.arg: root
+                            for argument in (
+                                item.args.posonlyargs
+                                + item.args.args
+                                + item.args.kwonlyargs
+                            )
+                            if (
+                                root := self._complex_annotation_root(
+                                    self._normalize_annotation(argument.annotation)
+                                )
+                            ) is not None
+                        }
+                        for child in ast.walk(item):
+                            field_name = None
+                            target_root = None
+                            if (
+                                isinstance(child, ast.AnnAssign)
+                                and isinstance(child.target, ast.Attribute)
+                                and isinstance(child.target.value, ast.Name)
+                                and child.target.value.id == 'self'
+                            ):
+                                field_name = child.target.attr
+                                target_root = self._complex_annotation_root(
+                                    self._normalize_annotation(child.annotation)
+                                )
+                            elif isinstance(child, ast.Assign) and isinstance(child.value, ast.Name):
+                                target_root = argument_roots.get(child.value.id)
+                                if target_root is not None:
+                                    field_name = next(
+                                        (
+                                            target.attr
+                                            for target in child.targets
+                                            if isinstance(target, ast.Attribute)
+                                            and isinstance(target.value, ast.Name)
+                                            and target.value.id == 'self'
+                                        ),
+                                        None,
+                                    )
+                            if field_name is None or target_root is None:
+                                continue
+                            previous_root = complex_fields.get(field_name)
+                            if previous_root is not None and previous_root != target_root:
+                                raise ValueError(
+                                    f"Conflicting complex types for field {field_name!r}: "
+                                    f"{previous_root!r} and {target_root!r}"
+                                )
+                            if field_name in complex_list_fields:
+                                raise ValueError(
+                                    f"Field {field_name!r} is declared as both a complex object "
+                                    "and a complex-object list"
+                                )
+                            complex_fields[field_name] = target_root
+                            property_registry[f'{field_name}_id'] = self._complex_field_spec(
+                                field_name
+                            )
+
                         # Parse all functions
                         # identify properties and setters by their decorators
                         is_getter = any(isinstance(d, ast.Name) and d.id == 'property' for d in item.decorator_list)
@@ -822,6 +1555,9 @@ class SquashCompiler(ast.NodeTransformer):
 
             # 2. BUILD FAT STRUCT PROPERTIES (not the @property, but the annotations)
             fat_struct.body = list(property_registry.values())
+            fat_struct._complex_fields = complex_fields
+            fat_struct._complex_list_fields = complex_list_fields
+            fat_struct._registry_root = root_name
             
             # 4. GENERATE V-TABLES
             for registry_key, impls in method_registry.items():
@@ -866,19 +1602,63 @@ class SquashCompiler(ast.NodeTransformer):
                 if method_name == '__init__':
                     # insert the new type_id argument
                     dispatcher.args.args.insert(1, ast.arg(arg='type_id', annotation=ast.Name(id='int', ctx=ast.Load())))
+                    dispatcher.args.args.insert(
+                        2,
+                        ast.arg(
+                            arg='instance_id',
+                            annotation=ast.Attribute(
+                                value=ast.Name(id='types', ctx=ast.Load()),
+                                attr='int64',
+                                ctx=ast.Load(),
+                            ),
+                        ),
+                    )
                     # and in the __init__ body, assign it to self.type_id
                     fat_init_args = copy.deepcopy(dispatcher.args)
-                    dispatcher.body.insert(0,ast.Assign(targets=[ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr='type_id', ctx=ast.Store())], 
-                                            value=ast.Name(id='type_id', ctx=ast.Load())))
+                    dispatcher.body.insert(
+                        0,
+                        ast.Assign(
+                            targets=[
+                                ast.Attribute(
+                                    value=ast.Name(id='self', ctx=ast.Load()),
+                                    attr='instance_id',
+                                    ctx=ast.Store(),
+                                )
+                            ],
+                            value=ast.Name(id='instance_id', ctx=ast.Load()),
+                        ),
+                    )
+                    dispatcher.body.insert(
+                        1,
+                        ast.Assign(
+                            targets=[
+                                ast.Attribute(
+                                    value=ast.Name(id='self', ctx=ast.Load()),
+                                    attr='type_id',
+                                    ctx=ast.Store(),
+                                )
+                            ],
+                            value=ast.Name(id='type_id', ctx=ast.Load()),
+                        ),
+                    )
                     # Initialize all other properties with their default values (0, '', None)
                     # Taken care of in _initial_value
                     # But except type_id
                     for prop_name in property_registry:
-                        if prop_name == 'type_id':
+                        if prop_name in ('type_id', 'instance_id'):
                             continue
+                        default_value = (
+                            ast.Constant(value=-1)
+                            if prop_name.endswith('_id')
+                            and prop_name[:-3] in complex_fields
+                            else ast.Constant(value=None)
+                            if prop_name.endswith('_ids')
+                            and prop_name[:-4] in complex_list_fields
+                            else self._initial_value(property_registry[prop_name].annotation)
+                        )
                         dispatcher.body.insert(1, ast.Assign(
                                                     targets=[ast.Attribute(value=ast.Name(id='self', ctx=ast.Load()), attr=prop_name, ctx=ast.Store())],
-                                                    value=self._initial_value(property_registry[prop_name].annotation),
+                                                    value=default_value,
                                                 ))
                 
                 fat_struct.body.append(dispatcher)
@@ -890,9 +1670,6 @@ class SquashCompiler(ast.NodeTransformer):
             # def Child(arg1, arg2):
             # #     return Parent(type_id=TYPE_CHILD, arg1=arg1, arg2=arg2)
             for child_cls in all_classes:
-                # the root does not need one, this is still a class with a proper __init__
-                if child_cls == root_name: continue
-
                 facade_args = ast.arguments()
                 #Take the original child class init arguments
                 for i in range(0, len(self.mro_map[child_cls])):
@@ -927,6 +1704,8 @@ class SquashCompiler(ast.NodeTransformer):
                         ] + default_args,
                     ))], decorator_list=[]
                 )
+                facade._factory_root = root_name
+                facade._factory_type = child_cls
                 new_module_body.append(facade)
 
 
@@ -943,123 +1722,324 @@ class SquashCompiler(ast.NodeTransformer):
 # ==============================================================================
 
 class JITInjector(ast.NodeTransformer):
-    '''
-    inject the @jitclass or @njit decorators into the generated code, so that the JIT version can be compiled by numba
-    '''
-    def __init__(self):
-        self.compiled_class_names = set()
+    """Decorate fat structs, create typed registries, and generate Python factories."""
 
-    def visit_Module(self, node: ast.Module) -> ast.Module:
-        _insert_module_imports(
-            node,
-            "from typing import Optional\nfrom numba.experimental import jitclass\nfrom numba import njit, deferred_type, optional",
-        )
-        self.compiled_class_names = {
-            statement.name
-            for statement in node.body
-            if isinstance(statement, ast.ClassDef)
-        }
-        import_index = 0
-        if (
-            node.body
-            and isinstance(node.body[0], ast.Expr)
-            and isinstance(node.body[0].value, ast.Constant)
-            and isinstance(node.body[0].value.value, str)
-        ):
-            import_index = 1
-        while import_index < len(node.body) and isinstance(
-            node.body[import_index], (ast.Import, ast.ImportFrom)
-        ):
-            import_index += 1
-        declarations = [
-            ast.Assign(
-                targets=[ast.Name(id=self._deferred_name(class_name), ctx=ast.Store())],
-                value=ast.Call(func=ast.Name(id='deferred_type', ctx=ast.Load()), args=[], keywords=[]),
-            )
-            for class_name in sorted(self.compiled_class_names)
-        ]
-        node.body[import_index:import_index] = declarations
-        self.generic_visit(node)
-        return node
+    def __init__(self):
+        self.class_names: list[str] = []
+        self.class_indexes: dict[str, int] = {}
+        self.internal_names: dict[str, str] = {}
+        self.factory_metadata: dict[str, tuple[str, str]] = {}
+        self.constructor_args: dict[str, list[str]] = {}
+        self.constructor_complex_args: dict[str, dict[str, bool]] = {}
+        self.constructor_complex_list_args: dict[str, set[str]] = {}
 
     @staticmethod
-    def _deferred_name(class_name: str) -> str:
-        return f"_DEFERRED_TYPE_{class_name.upper()}"
+    def _call(func: ast.expr, args: list[ast.expr]) -> ast.Call:
+        return ast.Call(func=func, args=args, keywords=[])
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        if node.name in ('is_instance', 'is_subclass'):
-            node.decorator_list.append(ast.Name(id='njit', ctx=ast.Load()))
-        return node
+    def visit_Module(self, node: ast.Module) -> ast.Module:
+        self.class_names = [
+            statement.name for statement in node.body
+            if isinstance(statement, ast.ClassDef)
+        ]
+        self.class_indexes = {name: index for index, name in enumerate(self.class_names)}
+        self.internal_names = {name: f'__FatStruct_{name}' for name in self.class_names}
+        self.factory_metadata = {
+            statement.name: (statement._factory_root, statement._factory_type)
+            for statement in node.body
+            if isinstance(statement, ast.FunctionDef) and hasattr(statement, '_factory_root')
+        }
+        registry_indexes = self.class_indexes
 
-    def visit_ClassDef(self, node: ast.ClassDef) -> list[ast.stmt]:
-        for item in node.body:
-            if not isinstance(item, ast.AnnAssign):
-                continue
-            annotation = item.annotation
-            optional_annotation = (
-                isinstance(annotation, ast.Subscript)
-                and isinstance(annotation.value, ast.Name)
-                and annotation.value.id == 'Optional'
-            )
-            annotation_type = annotation.slice if optional_annotation else annotation
-            if (
-                isinstance(annotation_type, ast.Name)
-                and annotation_type.id in self.compiled_class_names
-            ):
-                deferred_type = ast.Name(
-                    id=self._deferred_name(annotation_type.id),
-                    ctx=ast.Load(),
-                )
-                item.annotation = (
-                    ast.Call(
-                        func=ast.Name(id='optional', ctx=ast.Load()),
-                        args=[deferred_type],
-                        keywords=[],
-                    )
-                    if optional_annotation
-                    else deferred_type
-                )
-
-        class_annotation_normalizer = ForwardClassReferences(self.compiled_class_names)
-        for item in node.body:
-            if isinstance(item, ast.FunctionDef):
-                for argument in (
-                    item.args.posonlyargs
-                    + item.args.args
-                    + item.args.kwonlyargs
-                    + ([item.args.vararg] if item.args.vararg else [])
-                    + ([item.args.kwarg] if item.args.kwarg else [])
-                ):
-                    if argument.annotation is not None:
-                        argument.annotation = class_annotation_normalizer.visit(argument.annotation)
-                if item.returns is not None:
-                    item.returns = class_annotation_normalizer.visit(item.returns)
-
-        node.decorator_list.append(ast.Call(func=ast.Name(id='jitclass', ctx=ast.Load()), args=[], keywords=[]))
-        return [
+        _insert_module_imports(
             node,
-            ast.Expr(
-                value=ast.Call(
-                    func=ast.Attribute(
-                        value=ast.Name(id=self._deferred_name(node.name), ctx=ast.Load()),
-                        attr='define',
+            "from typing import List, Optional\n"
+            "from itertools import count as __count\n"
+            "from numba import njit, types\n"
+            "from numba.experimental import jitclass\n"
+            "from numba.typed import Dict as __NumbaDict\n"
+            "from numba.typed import List as NumbaList\n"
+            "def __to_id_list(values):\n"
+            "    if values is None:\n"
+            "        raise TypeError('Expected a list of compiled instances, not None')\n"
+            "    result = NumbaList.empty_list(types.int64)\n"
+            "    for value in values:\n"
+            "        if value is None:\n"
+            "            raise TypeError('List entries for compiled class references cannot be None')\n"
+            "        result.append(value.instance_id)\n"
+            "    return result",
+        )
+        transformed = []
+        for statement in node.body:
+            if isinstance(statement, ast.ClassDef):
+                transformer = ContextInjector(registry_indexes, {})
+                init = next(
+                    (item for item in statement.body
+                     if isinstance(item, ast.FunctionDef) and item.name == '__init__'),
+                    None,
+                )
+                self.constructor_complex_args[statement.name] = {
+                    argument.arg: transformer._annotation_allows_none(argument.annotation)
+                    for argument in (
+                        init.args.posonlyargs + init.args.args + init.args.kwonlyargs
+                        if init is not None else []
+                    )
+                    if argument.arg != 'self'
+                    and transformer._annotation_registry_root(argument.annotation) is not None
+                }
+                self.constructor_complex_list_args[statement.name] = {
+                    argument.arg
+                    for argument in (
+                        init.args.posonlyargs + init.args.args + init.args.kwonlyargs
+                        if init is not None else []
+                    )
+                    if argument.arg != 'self'
+                    and transformer._annotation_list_registry_root(argument.annotation) is not None
+                }
+                fat_class = transformer.visit_ClassDef(statement)
+                complex_list_fields = getattr(statement, '_complex_list_fields', {})
+                if complex_list_fields:
+                    init = next(
+                        (item for item in fat_class.body
+                         if isinstance(item, ast.FunctionDef) and item.name == '__init__'),
+                        None,
+                    )
+                    if init is not None:
+                        for item in init.body:
+                            if not isinstance(item, ast.Assign):
+                                continue
+                            if any(
+                                isinstance(target, ast.Attribute)
+                                and isinstance(target.value, ast.Name)
+                                and target.value.id == 'self'
+                                and target.attr in {
+                                    f'{field_name}_ids' for field_name in complex_list_fields
+                                }
+                                for target in item.targets
+                            ):
+                                item.value = self._empty_id_list()
+                init = next(
+                    (item for item in fat_class.body
+                     if isinstance(item, ast.FunctionDef) and item.name == '__init__'),
+                    None,
+                )
+                self.constructor_args[statement.name] = (
+                    [argument.arg for argument in init.args.args[4:]]
+                    if init is not None else []
+                )
+                self._remove_fat_class_annotations(fat_class)
+                fat_class.name = self.internal_names[statement.name]
+                fat_class.decorator_list.append(
+                    ast.Call(func=ast.Name(id='jitclass', ctx=ast.Load()), args=[], keywords=[])
+                )
+                transformed.append(fat_class)
+            elif isinstance(statement, ast.FunctionDef) and statement.name in self.factory_metadata:
+                transformed.append(self._make_factory(statement))
+            elif isinstance(statement, ast.FunctionDef) and statement.name in ('is_instance', 'is_subclass'):
+                statement.decorator_list.append(ast.Name(id='njit', ctx=ast.Load()))
+                transformed.append(statement)
+            else:
+                transformed.append(statement)
+
+        registry_initializers = []
+        for class_name, index in self.class_indexes.items():
+            registry_initializers.append(
+                ast.Assign(
+                    targets=[ast.Name(id=f'__registry_{index}', ctx=ast.Store())],
+                    value=self._call(
+                        ast.Attribute(
+                            value=ast.Name(id='__NumbaDict', ctx=ast.Load()),
+                            attr='empty',
+                            ctx=ast.Load(),
+                        ),
+                        [],
+                    ),
+                )
+            )
+            registry_initializers[-1].value.keywords = [
+                ast.keyword(arg='key_type', value=ast.Attribute(
+                    value=ast.Name(id='types', ctx=ast.Load()), attr='int64', ctx=ast.Load()
+                )),
+                ast.keyword(
+                    arg='value_type',
+                    value=ast.Attribute(
+                        value=ast.Attribute(
+                            value=ast.Name(id=self.internal_names[class_name], ctx=ast.Load()),
+                            attr='class_type',
+                            ctx=ast.Load(),
+                        ),
+                        attr='instance_type',
                         ctx=ast.Load(),
                     ),
-                    args=[
-                        ast.Attribute(
-                            value=ast.Attribute(
-                                value=ast.Name(id=node.name, ctx=ast.Load()),
-                                attr='class_type',
-                                ctx=ast.Load(),
-                            ),
-                            attr='instance_type',
-                            ctx=ast.Load(),
-                        )
-                    ],
-                    keywords=[],
-                )
+                ),
+            ]
+        registry_initializers.extend([
+            ast.Assign(
+                targets=[ast.Name(id='__registry', ctx=ast.Store())],
+                value=ast.Tuple(
+                    elts=[ast.Name(id=f'__registry_{index}', ctx=ast.Load())
+                          for index in range(len(self.class_names))],
+                    ctx=ast.Load(),
+                ),
             ),
+            ast.Assign(
+                targets=[ast.Name(id='__instance_ids', ctx=ast.Store())],
+                value=self._call(ast.Name(id='__count', ctx=ast.Load()), []),
+            ),
+        ])
+
+        last_class = max(
+            (
+                index
+                for index, item in enumerate(transformed)
+                if isinstance(item, ast.ClassDef)
+            ),
+            default=-1,
+        )
+        transformed[last_class + 1:last_class + 1] = registry_initializers
+        node.body = transformed
+        return node
+
+    def _make_factory(self, facade: ast.FunctionDef) -> ast.FunctionDef:
+        root_name, concrete_name = self.factory_metadata[facade.name]
+        internal_name = self.internal_names[root_name]
+        facade_names = {argument.arg for argument in (
+            facade.args.posonlyargs + facade.args.args + facade.args.kwonlyargs
+        )}
+        constructor_arguments = []
+        constructor_arguments = [
+            self._factory_constructor_argument(
+                argument,
+                argument in facade_names,
+                self.constructor_complex_args.get(root_name, {}).get(argument),
+                argument in self.constructor_complex_list_args.get(root_name, set()),
+            )
+            for argument in self.constructor_args.get(root_name, [])
         ]
+        instance_id_name = '__new_instance_id'
+        instance_name = '__new_instance'
+        registry_index = self.class_indexes[root_name]
+        body = [
+            ast.Assign(
+                targets=[ast.Name(id=instance_id_name, ctx=ast.Store())],
+                value=self._call(
+                    ast.Attribute(
+                        value=ast.Name(id='__instance_ids', ctx=ast.Load()),
+                        attr='__next__',
+                        ctx=ast.Load(),
+                    ),
+                    [],
+                ),
+            ),
+            ast.Assign(
+                targets=[ast.Name(id=instance_name, ctx=ast.Store())],
+                value=self._call(
+                    ast.Name(id=internal_name, ctx=ast.Load()),
+                    [
+                        ast.Name(id='__registry', ctx=ast.Load()),
+                        ast.Name(id=f'TYPE_{concrete_name.upper()}', ctx=ast.Load()),
+                        ast.Name(id=instance_id_name, ctx=ast.Load()),
+                        *constructor_arguments,
+                    ],
+                ),
+            ),
+            ast.Assign(
+                targets=[ast.Subscript(
+                    value=ast.Name(id=f'__registry_{registry_index}', ctx=ast.Load()),
+                    slice=ast.Name(id=instance_id_name, ctx=ast.Load()),
+                    ctx=ast.Store(),
+                )],
+                value=ast.Name(id=instance_name, ctx=ast.Load()),
+            ),
+            ast.Return(value=ast.Name(id=instance_name, ctx=ast.Load())),
+        ]
+        facade.body = body
+        self._remove_fat_annotations(facade)
+        return facade
+
+    @staticmethod
+    def _factory_constructor_argument(
+        argument: str,
+        is_provided: bool,
+        allows_none: bool | None,
+        is_list: bool,
+    ) -> ast.expr:
+        if is_list:
+            return ast.Call(
+                func=ast.Name(id='__to_id_list', ctx=ast.Load()),
+                args=[
+                    ast.Name(id=argument, ctx=ast.Load())
+                    if is_provided else ast.Tuple(elts=[], ctx=ast.Load())
+                ],
+                keywords=[],
+            )
+        if allows_none is not None:
+            if not is_provided:
+                return ast.Constant(value=-1)
+            argument_value = ast.Name(id=argument, ctx=ast.Load())
+            instance_id = ast.Attribute(
+                value=copy.deepcopy(argument_value),
+                attr='instance_id',
+                ctx=ast.Load(),
+            )
+            if allows_none:
+                return ast.IfExp(
+                    test=ast.Compare(
+                        left=argument_value,
+                        ops=[ast.Is()],
+                        comparators=[ast.Constant(value=None)],
+                    ),
+                    body=ast.Constant(value=-1),
+                    orelse=instance_id,
+                )
+            return instance_id
+        if is_provided:
+            return ast.Name(id=argument, ctx=ast.Load())
+        return ast.Constant(value=None)
+
+    @staticmethod
+    def _empty_id_list() -> ast.Call:
+        return ast.Call(
+            func=ast.Attribute(
+                value=ast.Name(id='NumbaList', ctx=ast.Load()),
+                attr='empty_list',
+                ctx=ast.Load(),
+            ),
+            args=[
+                ast.Attribute(
+                    value=ast.Name(id='types', ctx=ast.Load()),
+                    attr='int64',
+                    ctx=ast.Load(),
+                )
+            ],
+            keywords=[],
+        )
+
+    def _remove_fat_class_annotations(self, node: ast.ClassDef) -> None:
+        for item in node.body:
+            if isinstance(item, ast.FunctionDef):
+                self._remove_fat_annotations(item)
+
+    def _remove_fat_annotations(self, node: ast.FunctionDef) -> None:
+        for argument in (
+            node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+            + ([node.args.vararg] if node.args.vararg else [])
+            + ([node.args.kwarg] if node.args.kwarg else [])
+        ):
+            annotation = argument.annotation
+            if isinstance(annotation, ast.Name) and annotation.id in self.class_names:
+                argument.annotation = None
+            elif (
+                isinstance(annotation, ast.Subscript)
+                and isinstance(annotation.slice, ast.Name)
+                and annotation.slice.id in self.class_names
+            ):
+                argument.annotation = None
+        if isinstance(node.returns, ast.Name) and node.returns.id in self.class_names:
+            node.returns = None
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
+        return node
 
 
 def _insert_module_imports(node: ast.Module, import_source: str) -> None:
@@ -1176,8 +2156,15 @@ def transpile_code(source_code: str):
     ast.fix_missing_locations(tree)
     
     aot_tree = AOTForwardAnnotation().visit(copy.deepcopy(tree))
+    aot_tree.body = [
+        statement for statement in aot_tree.body
+        if not (
+            isinstance(statement, ast.FunctionDef)
+            and getattr(statement, '_factory_root', None) == statement.name
+        )
+    ]
     aot_tree = CompiledImportRewriter('_aot').visit(aot_tree)
-    _insert_module_imports(aot_tree, "from typing import Optional")
+    _insert_module_imports(aot_tree, "from typing import List, Optional\nfrom numba import types")
     aot_code = ast.unparse(aot_tree)
 
     #Jit methods need an additional treatments to assert that instance attributes are not none before being used 

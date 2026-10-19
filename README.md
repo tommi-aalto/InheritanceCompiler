@@ -27,3 +27,12 @@ Import compiled classes from the aggregate module, for example:
 ```python
 from ._compiled_jit import MyClass
 ```
+
+In the JIT output, fields annotated with a user-defined class or a list of
+user-defined classes are stored as `int64` instance IDs (`field_id` or
+`field_ids`) and resolved through a typed registry. Constructor facades still
+accept instances and lists of instances; compiled methods transparently resolve
+those references and thread the registry through internal calls. When calling
+a compiled jitclass method directly from Python, pass the module's `__registry`
+as the first argument after the instance. Optional lists (or optional entries
+within these lists) are not supported; use an empty list instead of `None`.
