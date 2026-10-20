@@ -13,6 +13,8 @@ SUPPORTED:
 Inheritance, multiple inheritance, diamond-style inheritance, and multiple
 inheritance across otherwise separate root hierarchies
 super(), isinstance(object, Class), issubclass (object, Class)
+An override may append parameters after the parent's parameters when each appended
+parameter has a default. Parent parameter names, types, and order must be preserved.
 
 When a class combines separate inheritance trees, the compiler creates an
 artificial squash root for those trees. Original class MROs are retained when

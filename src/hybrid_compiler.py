@@ -68,6 +68,8 @@ RULES THE COMPILER ENFORCES
        name).  Conflicts are a compile error.
     5. Compiled classes may only inherit from compiled classes; undecorated
        subclasses of compiled classes are rejected.
+    6. An override preserves its parent method's parameter names, types, and order; it may
+       append parameters only when each appended parameter has a default.
 
 KNOWN LIMITS / UNTESTED
     * Methods that return objects are not supported (return numbers/bools/None).
@@ -96,7 +98,7 @@ class CompileError(Exception):
 _T = TypeVar("_T")
 
 
-def c(obj: _T) -> _T:
+def compiled(obj: _T) -> _T:
     """Marker decorator.  Does nothing at runtime; the compiler finds it in the AST.
     Typed as identity so IDEs/type checkers keep seeing the original class or method."""
     return obj
@@ -206,9 +208,9 @@ class Ptr:
 def _is_marked(decorators: list[ast.expr]) -> bool:
     """True if the decorator list contains `c` or `c()`."""
     for d in decorators:
-        if isinstance(d, ast.Name) and d.id == "c":
+        if isinstance(d, ast.Name) and d.id == "compiled":
             return True
-        if isinstance(d, ast.Call) and isinstance(d.func, ast.Name) and d.func.id == "c":
+        if isinstance(d, ast.Call) and isinstance(d.func, ast.Name) and d.func.id == "compiled":
             return True
     return False
 
@@ -526,17 +528,21 @@ class HybridCompiler:
         return f"_hy_const_{attr}"
 
     # ------------------------------------------------------------------
-    # step 4: override signatures must agree
+    # step 4: override signatures must preserve the parent-call prefix
     # ------------------------------------------------------------------
     def _check_signatures(self):
-        key = lambda sig: [(p.name, p.kind, p.ent) for p in sig]
+        key = lambda sig: [(p.name, p.kind, p.ann, p.ent) for p in sig]
         for cls, info in self.classes.items():
             for m, sig in info.sigs.items():
                 for anc in self.mro[cls][1:]:
                     other = self.classes[anc].sigs.get(m)
-                    if other is not None and key(other) != key(sig):
+                    if other is None:
+                        continue
+                    if len(sig) < len(other) or key(sig[:len(other)]) != key(other):
                         raise CompileError(f"{cls}.{m} overrides {anc}.{m} with a different signature "
-                                           f"(parameter names/types must match so dispatch can forward arguments)")
+                                           f"(parent parameter names/types/order must match so dispatch can forward arguments)")
+                    if any(p.default is None for p in sig[len(other):]):
+                        raise CompileError(f"{cls}.{m} extends {anc}.{m} with parameters that must have default values")
 
     # ------------------------------------------------------------------
     # step 5: memory layout
@@ -707,7 +713,8 @@ class HybridCompiler:
     def _gen_dispatch(self, k: str, m: str) -> str:
         """Virtual call on a pointer whose STATIC class is k: pick the implementation
         Python's MRO would pick for the runtime class, and hand it the row viewed as that
-        implementation's class (a record: carray(...)[0])."""
+        implementation's class (a record: carray(...)[0]). Child-only parameters are supplied
+        with their declared defaults so calls through a parent-typed pointer remain valid."""
         sig = self.sig_of(k, m)
         params = self.flat_params(sig)
         groups: dict[tuple[str, str], list[str]] = {}
@@ -716,7 +723,12 @@ class HybridCompiler:
             if impl:
                 groups.setdefault((impl, self.proj_of[(d, impl)]), []).append(d)
         args = ", ".join(params)
-        body = lambda key: [f"return {key[0]}__{m}(carray(p, 1, {key[1]})[0], self_addr{', ' + args if args else ''})"]
+
+        def body(key):
+            call_args = self._forwarded_method_args(sig, self.classes[key[0]].sigs[m])
+            return [f"return {key[0]}__{m}(carray(p, 1, {key[1]})[0], self_addr"
+                    f"{', ' + ', '.join(call_args) if call_args else ''})"]
+
         lines = ["@njit(cache=True)", f"def dispatch_{k}_{m}(self_type, self_addr{', ' + args if args else ''}):",
                  f"    if self_addr == 0:", f"        raise ValueError('null reference calling {k}.{m}')",
                  "    p = _to_voidptr(self_addr)"]
@@ -734,12 +746,33 @@ class HybridCompiler:
             nxt = next((a for a in mro[mro.index(x) + 1:] if m in self.classes[a].jit_methods), None)
             if nxt:
                 groups.setdefault((nxt, self.proj_of[(d, nxt)]), []).append(d)
+        sig = self._super_sig(x, m)
         args = ", ".join(params)
-        body = lambda key: [f"return {key[0]}__{m}(carray(p, 1, {key[1]})[0], self_addr{', ' + args if args else ''})"]
+
+        def body(key):
+            call_args = self._forwarded_method_args(sig, self.classes[key[0]].sigs[m])
+            return [f"return {key[0]}__{m}(carray(p, 1, {key[1]})[0], self_addr"
+                    f"{', ' + ', '.join(call_args) if call_args else ''})"]
+
         lines = ["@njit(cache=True)", f"def super_from_{x}_{m}(self_type, self_addr{', ' + args if args else ''}):",
                  "    p = _to_voidptr(self_addr)"]
         lines += self._chain(groups, body, f"super().{m}(): no implementation after {x} in the MRO")
         return "\n".join(lines) + "\n"
+
+    def _forwarded_method_args(self, caller_sig: list[Param], implementation_sig: list[Param]) -> list[str]:
+        """Flatten caller parameters and append an implementation's defaulted suffix."""
+        args = self.flat_params(caller_sig)
+        for param in implementation_sig[len(caller_sig):]:
+            if param.default is None:
+                raise CompileError("overridden method has an appended parameter without a default value")
+            if param.kind == "ent":
+                if not (isinstance(param.default, ast.Constant) and param.default.value is None):
+                    raise CompileError(
+                        f"object parameter '{param.name}' added by an override must default to None")
+                args.extend(("0", "0"))
+            else:
+                args.append(ast.unparse(param.default))
+        return args
 
     def _super_sig(self, x: str, m: str) -> list[Param]:
         for a in self.mro[x][1:]:
