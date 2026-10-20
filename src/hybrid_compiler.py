@@ -1,10 +1,10 @@
 """
-ecs_compiler.py -- "Python OOP -> flat Numba code + numpy-backed proxies"
-=========================================================================
+hybrid_compiler.py -- "Python OOP -> flat Numba code + numpy-backed proxies"
+============================================================================
 
 WHAT THE USER WRITES
     Ordinary Python OOP (multiple inheritance, super(), polymorphism, numpy arrays).
-        from ecs_compiler import c          # marker decorator, does nothing at runtime
+        from hybrid_compiler import c       # marker decorator, does nothing at runtime
 
         @c                                   # <- class is compiled
         class Entity:
@@ -21,19 +21,41 @@ WHAT THE COMPILER PRODUCES (one .py file)
       as a parent row, so parent methods / parent field accesses work on any child.
       (Projections that are byte-identical are de-duplicated -> one Numba
       specialisation per distinct layout, not per class.)
-    * @njit functions  Class__method(self_row, ...)   (one per @c method)
+    * @njit functions  Class__method(self, self_addr, ...)
+          `self` is a numpy RECORD (rows[0]), so inside a method the user's own
+          `self.health += 1` is plain record attribute access: NO rewriting.
     * dispatchers      dispatch_K_m(type, addr, ...)  virtual call on a K-typed pointer
     * super routers    super_from_X_m(type, addr, ...) follows the RUNTIME object's MRO
-    * field accessors  get_K_col / set_K_col          for fields reached via pointers
     * Python proxy classes that OWN their row (and every buffer) and expose the
       fields as properties.  The Python garbage collector therefore keeps every
       pointer target alive (proxies keep strong refs to what they point to).
 
+ONE MECHANISM FOR EVERYTHING THAT IS NOT `self`
+    Numba cannot hold two different record types in one variable, so any access through a
+    (type_id, addr) pointer must branch on the type id and use the matching view.  Instead
+    of a second code generator for fields, field access reuses the method machinery:
+        other.health        ->  dispatch_Entity__hy_get_health(t, a)
+        other.health = v    ->  dispatch_Entity__hy_set_health(t, a, v)
+        other.arr           ->  dispatch_Entity__hy_arr_arr(t, a)
+        other.CONST         ->  dispatch_Entity__hy_const_CONST(t, a)      (only if overridden)
+    where  Entity___hy_get_health(self, self_addr)  is a generated method whose whole body
+    is  `return self.health`.  So a pointer access is "a method call through the dispatcher",
+    and what runs inside is the same plain `self.x` attribute access as everywhere else.
+
 POINTERS ("fat pointer" = two int64)
-    (type_id, addr).  addr is `row.ctypes.data` of the target's row; 0 means None.
-    Inside JIT code the address is turned back into an array view with
-        carray(_to_voidptr(addr), 1, some_projected_dtype)
+    (type_id, addr).  addr is the address of the target's row; 0 means None.
+    A list of objects is an int64 array field of shape (cap, 2) holding (type_id, addr)
+    pairs plus a count field -- i.e. it is read exactly like any numpy array field.
+    Inside JIT code an address becomes a record again with
+        carray(_to_voidptr(addr), 1, some_projected_dtype)[0]
     (`_to_voidptr` is a 1-instruction LLVM intrinsic: inttoptr).
+
+DEBUG MODE
+    Set the environment variable HYBRID_DEBUG=1 before importing the generated module and
+    it runs WITHOUT Numba: every @njit function is an ordinary Python function (pdb, print,
+    breakpoints), `carray` is ctypes over the address, and records are a thin attribute
+    wrapper over numpy void scalars.  Same code, same semantics -- it is also how the tests
+    run here.  It verifies the compiler's logic, NOT that Numba accepts the generated code.
 
 RULES THE COMPILER ENFORCES
     1. JIT writes DATA, Python writes POINTERS.  JIT code may not re-point refs,
@@ -51,8 +73,9 @@ KNOWN LIMITS / UNTESTED
     * Methods that return objects are not supported (return numbers/bools/None).
     * Mutual recursion between @c methods may need explicit Numba signatures.
     * Numba-specific pieces (carray over a voidptr with a record dtype, records with
-      explicit offsets, `arr.ctypes.data`) are written from documentation and must be
-      verified on your Numba version.  See test_ecs_compiler.py for what was tested.
+      explicit offsets, passing a record from carray(...)[0] to another njit function and
+      mutating it) are written from documentation: run numba_smoke_test.py on a machine
+      with Numba to verify them on your version.
 """
 from __future__ import annotations
 
@@ -100,8 +123,9 @@ class Field:
     kind:
       'prim'    float/int/bool           -> 1 column
       'ref'     another compiled class   -> 2 columns  (name_type, name_addr)
-      'objlist' list[Class(, cap)]       -> 3 columns  (name_buf, name_count, name_cap)
-                                           buf = address of an int64[cap*2] (type, addr) array
+      'objlist' list[Class(, cap)]       -> 3 columns  (name_data, name_shape[2], name_count)
+                                           an int64 array of shape (cap, 2) holding
+                                           (type_id, addr) pairs: it IS an array field
       'array'   np.ndarray[dtype, ndim]  -> 2 columns  (name_data, name_shape[ndim])
     """
     name: str
@@ -123,8 +147,13 @@ class Field:
         if self.kind == "ref":
             return [(f"{n}_type", "int64", 0), (f"{n}_addr", "int64", 0)]
         if self.kind == "objlist":
-            return [(f"{n}_buf", "int64", 0), (f"{n}_count", "int64", 0), (f"{n}_cap", "int64", 0)]
+            return [(f"{n}_data", "int64", 0), (f"{n}_shape", "int64", 2), (f"{n}_count", "int64", 0)]
         return [(f"{n}_data", "int64", 0), (f"{n}_shape", "int64", self.ndim)]
+
+    def array_helper(self) -> str:
+        """Name of the generated `(addr, shape) -> numpy view` function for array-like fields."""
+        dt, nd = (self.dtype, self.ndim) if self.kind == "array" else ("int64", 2)
+        return f"_arr_{dt}_{nd}d"
 
 
 @dataclass
@@ -151,6 +180,7 @@ class ClassInfo:
     py_fields: set[str] = field(default_factory=set)               # python-only annotated names
     consts: dict[str, tuple[str, str]] = field(default_factory=dict)  # attr -> (global name, source)
     jit_methods: dict[str, ast.FunctionDef] = field(default_factory=dict)
+    synth: dict[str, ast.FunctionDef] = field(default_factory=dict)   # generated accessor methods
     sigs: dict[str, list[Param]] = field(default_factory=dict)
     py_nodes: list[ast.stmt] = field(default_factory=list)         # copied verbatim into the proxy
     file: str = "<source>"                                         # for error messages
@@ -186,7 +216,7 @@ def _is_marked(decorators: list[ast.expr]) -> bool:
 # =====================================================================
 # 2. THE COMPILER
 # =====================================================================
-class ECSCompiler:
+class HybridCompiler:
     DEFAULT_LIST_CAPACITY = 16
 
     def __init__(self):
@@ -203,13 +233,10 @@ class ECSCompiler:
         self.proj_of: dict[tuple[str, str], str] = {}       # (descendant, ancestor) -> dtype var
         self.proj_specs: dict[str, tuple[list, int]] = {}   # dtype var -> (cols, itemsize)
         self._proj_by_key: dict[tuple, str] = {}
-        # things the lowering pass discovers it needs generated:
+        # (static class, method name) pairs the lowering pass needs a dispatcher for
+        # (user methods AND generated accessor methods share this one mechanism)
         self.need_dispatch: set[tuple[str, str]] = set()
         self.need_super: set[tuple[str, str]] = set()
-        self.need_getter: set[tuple[str, str]] = set()
-        self.need_setter: set[tuple[str, str]] = set()
-        self.need_arrget: set[tuple[str, str]] = set()
-        self.need_const: set[tuple[str, str]] = set()
 
     # ------------------------------------------------------------------
     # driver
@@ -219,7 +246,7 @@ class ECSCompiler:
 
     def compile_tree(self, tree: ast.Module) -> str:
         """Compile an already-parsed (possibly merged multi-module) tree.  ClassDef nodes may
-        carry an `_ecs_file` attribute, used to attribute errors to their source file."""
+        carry an `_hybrid_file` attribute, used to attribute errors to their source file."""
         self._reset()
         self._parse(tree)
         self._build_mro()
@@ -282,7 +309,7 @@ class ECSCompiler:
 
     @staticmethod
     def _np_dtype_name(node: ast.AST) -> str:
-        name = ECSCompiler._ann_name(node)
+        name = HybridCompiler._ann_name(node)
         name = {"float": "float64", "int": "int64", "bool": "bool_"}.get(name, name)
         try:
             np.dtype(name.rstrip("_") if name == "bool_" else name)
@@ -359,7 +386,7 @@ class ECSCompiler:
             else:
                 raise CompileError(f"{node.name}: compiled classes may only inherit from other @c classes, got {ast.unparse(b)}")
         info = ClassInfo(node.name, node, tid, bases)
-        info.file = getattr(node, "_ecs_file", "<source>")
+        info.file = getattr(node, "_hybrid_file", "<source>")
 
         for item in node.body:
             if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
@@ -445,9 +472,18 @@ class ECSCompiler:
                 return self.classes[anc].consts[attr][0]
         return None
 
+    def const_owner(self, cls: str, attr: str) -> str:
+        return next(a for a in self.mro[cls] if attr in self.classes[a].consts)
+
+    def decl_owner(self, cls: str, fname: str) -> str:
+        """The class (in cls's MRO) that declares field `fname`."""
+        return next(a for a in self.mro[cls] if fname in self.classes[a].decls)
+
     def find_method(self, cls: str, m: str) -> Optional[str]:
-        """First class in cls's MRO that defines @c method m (what Python would call)."""
-        return next((a for a in self.mro[cls] if m in self.classes[a].jit_methods), None)
+        """First class in cls's MRO that defines method m (what Python would call).
+        Generated accessor methods count: they are resolved exactly like user methods."""
+        return next((a for a in self.mro[cls]
+                     if m in self.classes[a].jit_methods or m in self.classes[a].synth), None)
 
     def sig_of(self, cls: str, m: str) -> list[Param]:
         return self.classes[self.find_method(cls, m)].sigs[m]
@@ -455,6 +491,39 @@ class ECSCompiler:
     @staticmethod
     def flat_params(sig: list[Param]) -> list[str]:
         return [n for p in sig for n in p.flat()]
+
+    # ---- generated accessor methods (field access through a pointer) ----------
+    def _synth(self, owner: str, name: str, params: list[Param], body: str) -> str:
+        """Register a tiny generated @njit method `Owner__name(self, self_addr, ...)` whose
+        body is plain record attribute access.  Returns its method name so callers can ask for
+        a dispatcher.  Because it is an ordinary method, ordinary dispatch picks the right
+        view for every runtime class."""
+        info = self.classes[owner]
+        if name not in info.synth:
+            flat = ["self", "self_addr"] + self.flat_params(params)
+            src = f"@njit(cache=True)\ndef {owner}__{name}({', '.join(flat)}):\n    {body}\n"
+            info.synth[name] = ast.parse(src).body[0]
+            info.sigs[name] = params
+        return name
+
+    def getter(self, cls: str, col: str, fname: str) -> str:
+        return self._synth(self.decl_owner(cls, fname), f"_hy_get_{col}", [], f"return self.{col}")
+
+    def setter(self, cls: str, col: str, fname: str) -> str:
+        return self._synth(self.decl_owner(cls, fname), f"_hy_set_{col}",
+                           [Param("val", "pass", "")], f"self.{col} = val")
+
+    def array_getter(self, cls: str, f: Field) -> str:
+        return self._synth(self.decl_owner(cls, f.name), f"_hy_arr_{f.name}", [],
+                           f"return {f.array_helper()}(self.{f.name}_data, self.{f.name}_shape)")
+
+    def const_getter(self, cls: str, attr: str) -> str:
+        """Class constant that some subclass overrides: Python's lookup depends on the RUNTIME
+        class, so give every defining class a tiny method returning its own value."""
+        for d in self.descendants[cls]:
+            owner = self.const_owner(d, attr)
+            self._synth(owner, f"_hy_const_{attr}", [], f"return {self.classes[owner].consts[attr][0]}")
+        return f"_hy_const_{attr}"
 
     # ------------------------------------------------------------------
     # step 4: override signatures must agree
@@ -496,9 +565,14 @@ class ECSCompiler:
             add(f)
 
         cols = [("type_id", "int64", 0, 0)]          # type_id is ALWAYS at offset 0
+        names = {"type_id"}
         off = 8
         for f in order:
             for col, dt, cnt in f.columns():
+                if col in names:
+                    raise CompileError(f"{cls}: column '{col}' (from field '{f.name}') collides with another "
+                                       f"field's column; rename one of the fields")
+                names.add(col)
                 off = _round_up(off, SIZE[dt])
                 cols.append((col, dt, cnt, off))
                 off += SIZE[dt] * (cnt or 1)
@@ -530,12 +604,18 @@ class ECSCompiler:
     # step 7: emit the module
     # ------------------------------------------------------------------
     def _emit(self) -> str:
-        # --- lower every @c method first; this discovers which helpers must exist ---
+        # --- lower every @c method first; this discovers which accessors/dispatchers must exist ---
         jit_src: list[str] = []
         for cls, info in self.classes.items():
             for m, fn in info.jit_methods.items():
+                jit_src.append(f"# {info.file}:{fn.lineno}  {cls}.{m}")
                 jit_src.append(ast.unparse(Lowerer(self, cls, m).lower(fn)))
                 jit_src.append("")
+        synth_src: list[str] = []
+        for cls, info in self.classes.items():
+            for name, fn in info.synth.items():
+                synth_src.append(ast.unparse(fn))
+                synth_src.append("")
 
         out: list[str] = [_HEADER]
         for imp in self.imports:
@@ -563,22 +643,16 @@ class ECSCompiler:
         out.append(_ANCESTRY_FUNCS)
 
         out.append(self._array_helpers())
-        out.append("# --- @c methods lowered to flat numba functions " + "-" * 25)
+        out.append("# --- @c methods lowered to flat numba functions (self is a numpy record) " + "-" * 8)
         out.extend(jit_src)
+        out.append("# --- generated accessor methods: field access through a pointer = a method call " + "-" * 3)
+        out.extend(synth_src)
 
-        out.append("# --- Generated routers (virtual dispatch, super(), field access) " + "-" * 5)
+        out.append("# --- Generated routers (virtual dispatch and super()) " + "-" * 15)
         for k, m in sorted(self.need_super):
             out.append(self._gen_super(k, m))
         for k, m in sorted(self.need_dispatch):
             out.append(self._gen_dispatch(k, m))
-        for k, col in sorted(self.need_getter):
-            out.append(self._gen_accessor(k, col, "get"))
-        for k, col in sorted(self.need_setter):
-            out.append(self._gen_accessor(k, col, "set"))
-        for k, fname in sorted(self.need_arrget):
-            out.append(self._gen_arrget(k, fname))
-        for k, attr in sorted(self.need_const):
-            out.append(self._gen_const(k, attr))
 
         out.append(_RUNTIME)
         for node in self.other_nodes:
@@ -600,10 +674,15 @@ class ECSCompiler:
                 "}, align=True)"]
 
     def _array_helpers(self) -> str:
-        """One `rebuild numpy view from (addr, shape)` helper per (dtype, ndim) in use."""
-        combos = sorted({(f.dtype, f.ndim) for i in self.classes.values() for f in i.decls.values() if f.kind == "array"})
+        """One `rebuild numpy view from (addr, shape)` helper per (dtype, ndim) in use.
+        Object lists are (cap, 2) int64 arrays, so they use the same helpers."""
+        combos = set()
+        for i in self.classes.values():
+            for f in i.decls.values():
+                if f.kind in ("array", "objlist"):
+                    combos.add(("int64", 2) if f.kind == "objlist" else (f.dtype, f.ndim))
         out = ["# --- numpy-array field helpers: (data address, shape) -> array view " + "-" * 8]
-        for dt, nd in combos:
+        for dt, nd in sorted(combos):
             shape = ", ".join(f"shape[{i}]" for i in range(nd)) + ("," if nd == 1 else "")
             out += ["@njit(cache=True)", f"def _arr_{dt}_{nd}d(addr, shape):",
                     "    if addr == 0:", "        raise ValueError('numpy array field is not assigned')",
@@ -627,8 +706,8 @@ class ECSCompiler:
 
     def _gen_dispatch(self, k: str, m: str) -> str:
         """Virtual call on a pointer whose STATIC class is k: pick the implementation
-        Python's MRO would pick for the runtime class, and view the row as that
-        implementation's class."""
+        Python's MRO would pick for the runtime class, and hand it the row viewed as that
+        implementation's class (a record: carray(...)[0])."""
         sig = self.sig_of(k, m)
         params = self.flat_params(sig)
         groups: dict[tuple[str, str], list[str]] = {}
@@ -637,7 +716,7 @@ class ECSCompiler:
             if impl:
                 groups.setdefault((impl, self.proj_of[(d, impl)]), []).append(d)
         args = ", ".join(params)
-        body = lambda key: [f"return {key[0]}__{m}(carray(p, 1, {key[1]}){', ' + args if args else ''})"]
+        body = lambda key: [f"return {key[0]}__{m}(carray(p, 1, {key[1]})[0], self_addr{', ' + args if args else ''})"]
         lines = ["@njit(cache=True)", f"def dispatch_{k}_{m}(self_type, self_addr{', ' + args if args else ''}):",
                  f"    if self_addr == 0:", f"        raise ValueError('null reference calling {k}.{m}')",
                  "    p = _to_voidptr(self_addr)"]
@@ -656,7 +735,7 @@ class ECSCompiler:
             if nxt:
                 groups.setdefault((nxt, self.proj_of[(d, nxt)]), []).append(d)
         args = ", ".join(params)
-        body = lambda key: [f"return {key[0]}__{m}(carray(p, 1, {key[1]}){', ' + args if args else ''})"]
+        body = lambda key: [f"return {key[0]}__{m}(carray(p, 1, {key[1]})[0], self_addr{', ' + args if args else ''})"]
         lines = ["@njit(cache=True)", f"def super_from_{x}_{m}(self_type, self_addr{', ' + args if args else ''}):",
                  "    p = _to_voidptr(self_addr)"]
         lines += self._chain(groups, body, f"super().{m}(): no implementation after {x} in the MRO")
@@ -664,58 +743,9 @@ class ECSCompiler:
 
     def _super_sig(self, x: str, m: str) -> list[Param]:
         for a in self.mro[x][1:]:
-            if m in self.classes[a].sigs:
+            if m in self.classes[a].jit_methods:
                 return self.classes[a].sigs[m]
         raise CompileError(f"super().{m}() in {x}: no @c method '{m}' in any base class")
-
-    def _col_info(self, k: str, col: str):
-        for c_, dt, cnt, _ in self.layouts[k].cols:
-            if c_ == col:
-                return dt, cnt
-        raise CompileError(f"internal: {k} has no column {col}")
-
-    def _proj_groups(self, k: str) -> dict:
-        """Group descendants of k by the projection dtype used to view them as k."""
-        groups: dict[tuple, list[str]] = {}
-        for d in self.descendants[k]:
-            groups.setdefault((self.proj_of[(d, k)],), []).append(d)
-        return groups
-
-    def _gen_accessor(self, k: str, col: str, kind: str) -> str:
-        """get_K_col(type, addr) / set_K_col(type, addr, val): read/write one column of a
-        pointer whose static class is k.  If all descendants place the column at the same
-        offset (prefix layout) there is NO type switch; otherwise a switch picks the
-        right projection."""
-        groups = self._proj_groups(k)
-        if kind == "get":
-            body = lambda key: [f"return carray(p, 1, {key[0]})[0]['{col}']"]
-            head = f"def get_{k}_{col}(self_type, self_addr):"
-        else:
-            body = lambda key: [f"carray(p, 1, {key[0]})[0]['{col}'] = val", "return"]
-            head = f"def set_{k}_{col}(self_type, self_addr, val):"
-        lines = ["@njit(cache=True)", head, "    if self_addr == 0:",
-                 f"        raise ValueError('null reference accessing {k}.{col}')",
-                 "    p = _to_voidptr(self_addr)"]
-        lines += self._chain(groups, body, f"bad type id in accessor {k}.{col}")
-        return "\n".join(lines) + "\n"
-
-    def _gen_arrget(self, k: str, fname: str) -> str:
-        f = self.fields[k][fname]
-        helper = f"_arr_{f.dtype}_{f.ndim}d"
-        body = lambda key: [f"row = carray(p, 1, {key[0]})", f"return {helper}(row[0]['{fname}_data'], row[0]['{fname}_shape'])"]
-        lines = ["@njit(cache=True)", f"def get_{k}_{fname}__arr(self_type, self_addr):", "    if self_addr == 0:",
-                 f"        raise ValueError('null reference accessing {k}.{fname}')", "    p = _to_voidptr(self_addr)"]
-        lines += self._chain(self._proj_groups(k), body, f"bad type id in accessor {k}.{fname}")
-        return "\n".join(lines) + "\n"
-
-    def _gen_const(self, k: str, attr: str) -> str:
-        """Class constant overridden in a subclass: Python's lookup depends on the runtime class."""
-        groups: dict[tuple, list[str]] = {}
-        for d in self.descendants[k]:
-            groups.setdefault((self.const_for(d, attr),), []).append(d)
-        lines = ["@njit(cache=True)", f"def const_{k}_{attr}(self_type, self_addr):"]
-        lines += self._chain(groups, lambda key: [f"return {key[0]}"], f"bad type id in const_{k}_{attr}")
-        return "\n".join(lines) + "\n"
 
     # ---- proxy classes --------------------------------------------------------
     def _prop_src(self, f: Field) -> str:
@@ -733,14 +763,14 @@ class ECSCompiler:
                 f"@{n}.setter\ndef {n}(self, value):\n    _set_array(self, {n!r}, value, {f.dtype!r}, {f.ndim})\n")
 
     def _wrapper_src(self, cls: str, m: str) -> str:
-        """Python-facing method: coerce arguments, view our row as `cls`, call the
-        specific JIT function.  Python's own MRO already chose the override, so no
-        dispatcher is needed at the entry point."""
+        """Python-facing method: coerce arguments, hand the JIT function this object's row
+        viewed as `cls` (a record) plus its address.  Python's own MRO already chose the
+        override, so no dispatcher is needed at the entry point."""
         fn = self.classes[cls].jit_methods[m]
         args = copy.deepcopy(fn.args)
         for a in args.args:
             a.annotation = None
-        call = [f"self._view({cls!r})"]
+        call = [f"self._rec({cls!r})", "self._addr"]
         for p in self.classes[cls].sigs[m]:
             if p.kind == "prim":
                 call.append(f"{p.ann}({p.name})")
@@ -752,8 +782,9 @@ class ECSCompiler:
 
     def _gen_proxy(self, cls: str) -> str:
         info = self.classes[cls]
-        bases = ", ".join(info.bases) if info.bases else "_ECSProxyMixin"
-        own = f"{cls.lower()}_dtype"
+        bases = ", ".join(info.bases) if info.bases else "HybridRoot"
+        # NOT f"{cls.lower()}_dtype": a class without new fields shares its parent's dtype
+        own = self.proj_of[(cls, cls)]
         proj = ", ".join(f"{a!r}: {self.proj_of[(cls, a)]}" for a in self.mro[cls])
         lists = tuple((f.name, f.cap, f.target) for f in self.fields[cls].values() if f.kind == "objlist")
         prims = tuple(f.name for f in self.fields[cls].values() if f.kind == "prim")
@@ -781,15 +812,16 @@ class ECSCompiler:
 class Lowerer(ast.NodeTransformer):
     """Rewrites one method body.
 
-    Object-valued expressions are never materialised as Python objects.  Instead
-    `ptr()` describes them as source text for (type, addr).  Every visitor that
-    can legitimately receive an object (attribute access, method call, comparison,
-    truth test, isinstance, for-loop over a list field, local assignment, call
-    argument) asks `ptr()` first; if an object reaches any OTHER position, the
-    visit_Name / visit_Attribute fallbacks raise a clear CompileError.
+    `self` is a numpy record, so `self.x` on a primitive field is left EXACTLY as the user
+    wrote it.  Everything else that touches an object is rewritten by asking `ptr()`:
+    object-valued expressions are never materialised as Python objects; `ptr()` describes
+    them as source text for (type, addr).  Every visitor that can legitimately receive an
+    object (attribute access, method call, comparison, truth test, isinstance, for-loop over
+    a list field, local assignment, call argument) asks `ptr()` first; if an object reaches
+    any OTHER position, the visit_Name / visit_Attribute fallbacks raise a clear CompileError.
     """
 
-    def __init__(self, comp: ECSCompiler, cls: str, method: str):
+    def __init__(self, comp: HybridCompiler, cls: str, method: str):
         self.c = comp
         self.cls = cls
         self.method = method
@@ -833,11 +865,38 @@ class Lowerer(ast.NodeTransformer):
         new.name = f"{self.cls}__{self.method}"
         new.returns = None
         new.decorator_list = [self._e("njit(cache=True)")]
-        new.args = ast.arguments(posonlyargs=[], args=[ast.arg(arg="self_row")] + [ast.arg(arg=n) for n in self.c.flat_params(sig)],
+        flat = ["self", "self_addr"] + self.c.flat_params(sig)
+        new.args = ast.arguments(posonlyargs=[], args=[ast.arg(arg=n) for n in flat],
                                  vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[])
-        prologue = ast.parse("self_type = self_row[0]['type_id']\nself_addr = self_row.ctypes.data").body
+        prologue = ast.parse("self_type = self.type_id").body
         new.body = prologue + self.block(new.body)
         return new
+
+    # ---- reading columns / arrays of an object --------------------------------
+    def col(self, owner: Ptr, f: Field, col: str) -> str:
+        """Source text that READS column `col` (of field `f`) of `owner`.
+        self: plain record attribute.  Anything else: a dispatched generated getter."""
+        if owner.is_self:
+            return f"self.{col}"
+        m = self.c.getter(owner.cls, col, f.name)
+        self.c.need_dispatch.add((owner.cls, m))
+        return f"dispatch_{owner.cls}_{m}({owner.t}, {owner.a})"
+
+    def arr_src(self, owner: Ptr, f: Field) -> str:
+        """Source text for the numpy view of an array-like field (arrays and object lists)."""
+        if owner.is_self:
+            return f"{f.array_helper()}(self.{f.name}_data, self.{f.name}_shape)"
+        m = self.c.array_getter(owner.cls, f)
+        self.c.need_dispatch.add((owner.cls, m))
+        return f"dispatch_{owner.cls}_{m}({owner.t}, {owner.a})"
+
+    def const_src(self, owner: Ptr, attr: str) -> str:
+        names = {self.c.const_for(d, attr) for d in self.c.descendants[owner.cls]}
+        if len(names) == 1:
+            return names.pop()
+        m = self.c.const_getter(owner.cls, attr)         # overridden below: depends on runtime class
+        self.c.need_dispatch.add((owner.cls, m))
+        return f"dispatch_{owner.cls}_{m}({owner.t}, {owner.a})"
 
     # ---- object-expression analysis ------------------------------------------
     def ptr(self, node) -> Optional[Ptr]:
@@ -853,7 +912,7 @@ class Lowerer(ast.NodeTransformer):
             if owner is not None:
                 f = self.c.fields[owner.cls].get(node.attr)
                 if f is not None and f.kind == "ref":
-                    return Ptr(f.target, self.col(owner, f"{f.name}_type"), self.col(owner, f"{f.name}_addr"))
+                    return Ptr(f.target, self.col(owner, f, f"{f.name}_type"), self.col(owner, f, f"{f.name}_addr"))
             return None
         if isinstance(node, ast.Subscript):
             lst = self.list_of(node.value)
@@ -861,9 +920,10 @@ class Lowerer(ast.NodeTransformer):
                 owner, f = lst
                 if isinstance(node.slice, ast.Slice):
                     self._err(node, "slicing object lists is not supported in JIT code")
-                buf, cnt = self.col(owner, f"{f.name}_buf"), self.col(owner, f"{f.name}_count")
-                idx = self.src(node.slice)
-                return Ptr(f.target, f"_list_type({buf}, {cnt}, {idx})", f"_list_addr({buf}, {cnt}, {idx})")
+                arr = self.arr_src(owner, f)
+                cnt = self.col(owner, f, f"{f.name}_count")
+                i = f"_idx({self.src(node.slice)}, {cnt})"      # Python list indexing rules
+                return Ptr(f.target, f"{arr}[{i}, 0]", f"{arr}[{i}, 1]")
         return None
 
     def list_of(self, node) -> Optional[tuple[Ptr, Field]]:
@@ -874,20 +934,6 @@ class Lowerer(ast.NodeTransformer):
                 if f is not None and f.kind == "objlist":
                     return owner, f
         return None
-
-    def col(self, owner: Ptr, col: str) -> str:
-        """Source text that READS column `col` of `owner`."""
-        if owner.is_self:
-            return f"self_row[0]['{col}']"
-        self.c.need_getter.add((owner.cls, col))
-        return f"get_{owner.cls}_{col}({owner.t}, {owner.a})"
-
-    def const_src(self, owner: Ptr, attr: str) -> str:
-        names = {self.c.const_for(d, attr) for d in self.c.descendants[owner.cls]}
-        if len(names) == 1:
-            return names.pop()
-        self.c.need_const.add((owner.cls, attr))        # overridden below: depends on runtime class
-        return f"const_{owner.cls}_{attr}({owner.t}, {owner.a})"
 
     def truth(self, node) -> ast.expr:
         """Python truthiness: an object is truthy iff it is not None."""
@@ -931,21 +977,15 @@ class Lowerer(ast.NodeTransformer):
             self._err(node, self._why_not_field(owner, attr))
         if f.kind == "prim":
             if owner.is_self:
-                r = self._e(f"self_row[0]['{attr}']")
-                r.ctx = node.ctx                       # keep Store/Load so `self.x += 1` still works
-                return r
+                return node                            # `self.x` is record attribute access: untouched
             if isinstance(node.ctx, ast.Load):
-                return self._e(self.col(owner, attr))
+                return self._e(self.col(owner, f, attr))
             self._err(node, "unsupported assignment target")
         if f.kind == "array":
             if not isinstance(node.ctx, ast.Load):
                 self._err(node, f"cannot re-point array field '{attr}' in JIT code (JIT writes data, Python writes pointers); "
                                 f"write into it instead: self.{attr}[i] = ...")
-            helper = f"_arr_{f.dtype}_{f.ndim}d"
-            if owner.is_self:
-                return self._e(f"{helper}(self_row[0]['{attr}_data'], self_row[0]['{attr}_shape'])")
-            self.c.need_arrget.add((owner.cls, attr))
-            return self._e(f"get_{owner.cls}_{attr}__arr({owner.t}, {owner.a})")
+            return self._e(self.arr_src(owner, f))
         self._err(node, f"'{attr}' is an object {'reference' if f.kind == 'ref' else 'list'}; {self._OBJ_MSG}")
 
     # ---- statements ----------------------------------------------------------
@@ -971,16 +1011,17 @@ class Lowerer(ast.NodeTransformer):
                 if f.kind != "prim":
                     self._err(node, f"JIT code cannot assign {f.kind} field '{tgt.attr}' (JIT writes data, "
                                     f"Python writes pointers). Assign it from Python, or write into it in place.")
-                if not owner.is_self:                   # other.x = v  -> set_K_x(type, addr, v)
-                    self.c.need_setter.add((owner.cls, tgt.attr))
-                    return ast.Expr(value=ast.Call(func=ast.Name(id=f"set_{owner.cls}_{tgt.attr}", ctx=ast.Load()),
+                if not owner.is_self:                   # other.x = v  -> dispatch_K__hy_set_x(type, addr, v)
+                    m = self.c.setter(owner.cls, tgt.attr, f.name)
+                    self.c.need_dispatch.add((owner.cls, m))
+                    return ast.Expr(value=ast.Call(func=ast.Name(id=f"dispatch_{owner.cls}_{m}", ctx=ast.Load()),
                                                    args=[self._e(owner.t), self._e(owner.a), self.visit(node.value)], keywords=[]))
         if isinstance(tgt, ast.Subscript) and self.list_of(tgt.value) is not None:
             self._err(node, "JIT code cannot assign list elements (Python writes pointers)")
         return self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign):
-        s = ECSCompiler._ann_name(node.annotation)
+        s = HybridCompiler._ann_name(node.annotation)
         if s in self.c.classes and isinstance(node.target, ast.Name):
             self.declare(node.target.id, s, node)
             if node.value is None:
@@ -1000,10 +1041,11 @@ class Lowerer(ast.NodeTransformer):
                     self._err(node, f"'{node.target.attr}' cannot be updated in JIT code")
                 if not owner.is_self:                   # other.x += v  -> set(get() op v)
                     attr = node.target.attr
-                    self.c.need_setter.add((owner.cls, attr))
-                    get = self._e(self.col(owner, attr))
+                    m = self.c.setter(owner.cls, attr, f.name)
+                    self.c.need_dispatch.add((owner.cls, m))
+                    get = self._e(self.col(owner, f, attr))
                     new = ast.BinOp(left=get, op=node.op, right=self.visit(node.value))
-                    return ast.Expr(value=ast.Call(func=ast.Name(id=f"set_{owner.cls}_{attr}", ctx=ast.Load()),
+                    return ast.Expr(value=ast.Call(func=ast.Name(id=f"dispatch_{owner.cls}_{m}", ctx=ast.Load()),
                                                    args=[self._e(owner.t), self._e(owner.a), new], keywords=[]))
         return self.generic_visit(node)
 
@@ -1016,14 +1058,14 @@ class Lowerer(ast.NodeTransformer):
             self._err(node, "iterating an object list needs a simple loop variable")
         var = node.target.id
         self.tmp += 1
-        n, b, i = f"_n{self.tmp}", f"_b{self.tmp}", f"_i{self.tmp}"
+        n, r, i = f"_n{self.tmp}", f"_r{self.tmp}", f"_i{self.tmp}"
         self.declare(var, f.target, node)
         stmts = ast.parse(
-            f"{n} = {self.col(owner, f.name + '_count')}\n"
-            f"{b} = {self.col(owner, f.name + '_buf')}\n"
+            f"{n} = {self.col(owner, f, f.name + '_count')}\n"
+            f"{r} = {self.arr_src(owner, f)}\n"
             f"for {i} in range({n}):\n"
-            f"    {var}_type = _list_type({b}, {n}, {i})\n"
-            f"    {var}_addr = _list_addr({b}, {n}, {i})\n").body
+            f"    {var}_type = {r}[{i}, 0]\n"
+            f"    {var}_addr = {r}[{i}, 1]\n").body
         loop = stmts[2]
         loop.body = loop.body + self.block(node.body)
         loop.orelse = self.block(node.orelse) if node.orelse else []
@@ -1143,7 +1185,7 @@ class Lowerer(ast.NodeTransformer):
         if isinstance(f, ast.Name) and f.id == "len" and len(node.args) == 1:
             lst = self.list_of(node.args[0])
             if lst is not None:
-                return self._e(self.col(lst[0], lst[1].name + "_count"))
+                return self._e(self.col(lst[0], lst[1], lst[1].name + "_count"))
         if isinstance(f, ast.Name) and f.id in self.c.classes:
             self._err(node, f"cannot construct compiled objects ('{f.id}(...)') in JIT code; create them in Python")
         # super().m(...)
@@ -1173,23 +1215,76 @@ class Lowerer(ast.NodeTransformer):
 # 4. FIXED TEXT BLOCKS COPIED INTO EVERY OUTPUT MODULE
 # =====================================================================
 _HEADER = '''\
-# AUTO-GENERATED by ecs_compiler.py -- do not edit.  Delete the numba cache (__pycache__/*.nbi,*.nbc)
+# AUTO-GENERATED by hybrid_compiler.py -- do not edit.  Delete the numba cache (__pycache__/*.nbi,*.nbc)
 # whenever this file is regenerated: Numba's cache does not notice changed globals/dtypes.
 from __future__ import annotations
+import os
 import numpy as np
-from numba import njit, types, carray
-from numba.extending import intrinsic
-from llvmlite import ir
 
+# HYBRID_DEBUG=1 -> run everything as plain Python (no Numba needed): pdb, print and breakpoints work.
+_DEBUG = os.environ.get("HYBRID_DEBUG") == "1"
 
-@intrinsic
-def _to_voidptr(typingctx, addr):
-    """int address -> void*.  Numba has no pure-python way to do this; the LLVM
-    instruction `inttoptr` does exactly it.  `ir.IntType(8).as_pointer()` is LLVM's
-    generic byte pointer (i8*), which is what Numba's `voidptr` maps to."""
-    def codegen(context, builder, signature, args):
-        return builder.inttoptr(args[0], ir.IntType(8).as_pointer())
-    return types.voidptr(types.intp), codegen
+if _DEBUG:
+    import ctypes
+
+    def njit(*a, **k):
+        """Debug stand-in: the decorated function stays an ordinary Python function."""
+        return a[0] if a and callable(a[0]) else (lambda f: f)
+
+    def _to_voidptr(addr):
+        return int(addr)
+
+    class _Rec:
+        """Debug stand-in for a Numba record: attribute access reads/writes the numpy void
+        scalar it wraps (which is a VIEW of the row's memory, so writes go through).
+        Not np.record: numpy's own attributes (size, data, ...) would shadow field names."""
+        __slots__ = ("_v",)
+
+        def __init__(self, v):
+            object.__setattr__(self, "_v", v)
+
+        def __getattr__(self, name):             # only runs when normal lookup fails
+            return self._v[name]
+
+        def __setattr__(self, name, value):
+            self._v[name] = value
+
+        def __repr__(self):
+            return f"_Rec({self._v!r})"
+
+    class _RecArray:
+        """carray(...) over a record dtype: indexing gives a _Rec."""
+        __slots__ = ("_a",)
+
+        def __init__(self, a):
+            self._a = a
+
+        def __getitem__(self, i):
+            return _Rec(self._a[i])
+
+    def carray(ptr, shape, dtype=None):
+        """Debug stand-in for numba.carray: a numpy view over raw memory (ctypes)."""
+        dt = np.dtype(dtype)
+        shp = (shape,) if isinstance(shape, (int, np.integer)) else tuple(int(s) for s in shape)
+        nbytes = int(np.prod(shp)) * dt.itemsize
+        buf = (ctypes.c_char * nbytes).from_address(int(ptr))
+        arr = np.frombuffer(buf, dtype=dt).reshape(shp)
+        return _RecArray(arr) if dt.names else arr
+else:
+    from numba import njit, types, carray
+    from numba.extending import intrinsic
+    from llvmlite import ir
+
+    _Rec = None
+
+    @intrinsic
+    def _to_voidptr(typingctx, addr):
+        """int address -> void*.  Numba has no pure-python way to do this; the LLVM
+        instruction `inttoptr` does exactly it.  `ir.IntType(8).as_pointer()` is LLVM's
+        generic byte pointer (i8*), which is what Numba's `voidptr` maps to."""
+        def codegen(context, builder, signature, args):
+            return builder.inttoptr(args[0], ir.IntType(8).as_pointer())
+        return types.voidptr(types.intp), codegen
 
 '''
 
@@ -1208,22 +1303,13 @@ def is_subclass(child_type_id, parent_type_id):
 
 
 @njit(cache=True)
-def _list_type(buf, count, i):
-    """Type id of element i of an object list.  The list buffer is int64[cap*2] of (type, addr)."""
+def _idx(i, n):
+    """Python list indexing rules: negative wraps around, out of range raises."""
     if i < 0:
-        i += count
-    if i < 0 or i >= count:
+        i += n
+    if i < 0 or i >= n:
         raise IndexError('list index out of range')
-    return carray(_to_voidptr(buf), 2 * count, np.int64)[2 * i]
-
-
-@njit(cache=True)
-def _list_addr(buf, count, i):
-    if i < 0:
-        i += count
-    if i < 0 or i >= count:
-        raise IndexError('list index out of range')
-    return carray(_to_voidptr(buf), 2 * count, np.int64)[2 * i + 1]
+    return i
 
 '''
 
@@ -1284,10 +1370,11 @@ def _set_list(owner, name, value):
 
 class _ObjList(MutableSequence):
     """list[Class] field.  Python keeps a normal list of strong references (`_items`);
-    the row holds (buf, count, cap) where buf points at an int64[cap*2] array of
-    (type_id, addr) pairs that JIT code reads.  EVERY mutation builds a new item list,
-    validates it, and rewrites the buffer (O(n), but always consistent).  Growth just
-    allocates a bigger buffer and updates the row -- JIT code never resizes."""
+    the row describes an int64 array of shape (cap, 2) -- (type_id, addr) per element --
+    exactly like a numpy array field (name_data, name_shape), plus name_count.
+    EVERY mutation builds a new item list, validates it, and rewrites the buffer (O(n),
+    but always consistent).  Growth just allocates a bigger buffer and updates the row --
+    JIT code never resizes."""
 
     def __init__(self, owner, name, cap, elem):
         self._owner, self._name, self._elem = owner, name, elem
@@ -1297,7 +1384,7 @@ class _ObjList(MutableSequence):
 
     def _resize(self, cap):
         self._cap = cap
-        self._buf = np.zeros(cap * 2, dtype=np.int64)       # owned here -> address stays valid
+        self._buf = np.zeros((cap, 2), dtype=np.int64)      # owned here -> address stays valid
 
     def _sync(self):
         items = self._items
@@ -1307,12 +1394,12 @@ class _ObjList(MutableSequence):
         buf[:] = 0
         for i, it in enumerate(items):
             if it is not None:
-                buf[2 * i] = it.TYPE_ID
-                buf[2 * i + 1] = it._addr
+                buf[i, 0] = it.TYPE_ID
+                buf[i, 1] = it._addr
         row = self._owner._row
-        row[self._name + '_buf'][0] = buf.ctypes.data
+        row[self._name + '_data'][0] = buf.ctypes.data
+        row[self._name + '_shape'][0, :] = buf.shape
         row[self._name + '_count'][0] = len(items)
-        row[self._name + '_cap'][0] = self._cap
 
     def _commit(self, new_items):
         cls = globals()[self._elem]
@@ -1353,12 +1440,12 @@ class _ObjList(MutableSequence):
         return f"_ObjList({self._items!r})"
 
 
-_INTERNAL_ATTRS = frozenset(('_mem', '_row', '_addr', '_refs', '_arrays', '_views', '_lists'))
+_INTERNAL_ATTRS = frozenset(('_mem', '_row', '_addr', '_refs', '_arrays', '_views', '_recs', '_lists'))
 
 
-class _ECSProxyMixin:
-    """Shared parent of every generated proxy class (the user's classes are rewritten
-    to inherit from it).  Owns the memory, the strong references and pickling.
+class HybridRoot:
+    """Root of every generated proxy class (the user's classes are rewritten to inherit
+    from it).  Owns the memory, the strong references and pickling.
 
         _mem    int64 buffer, the actual storage (8-byte aligned)
         _row    1-element array of this class's dtype over _mem   (NEVER reassigned)
@@ -1367,26 +1454,41 @@ class _ECSProxyMixin:
         _arrays strong refs to numpy arrays whose addresses are stored in the row
         _lists  _ObjList wrappers
         _views  cache of projected views (_row seen as an ancestor)
+        _recs   cache of those views' first record: what a JIT method receives as `self`
     """
 
     def __new__(cls, *args, **kwargs):
+        # Because we override __new__, object.__init__ would silently swallow constructor
+        # arguments when no class in the MRO defines __init__.  Plain Python raises instead.
+        if (args or kwargs) and cls.__init__ is object.__init__:
+            raise TypeError(f"{cls.__name__}() takes no arguments")
         self = object.__new__(cls)
         self._mem = np.zeros(cls._ITEMSIZE // 8, dtype=np.int64)
         self._row = np.frombuffer(self._mem, dtype=cls._DTYPE, count=1)
         self._addr = self._mem.ctypes.data
         self._row['type_id'][0] = cls.TYPE_ID
-        self._refs, self._arrays, self._views = {}, {}, {}
+        self._refs, self._arrays, self._views, self._recs = {}, {}, {}, {}
         self._lists = {n: _ObjList(self, n, cap, elem) for n, cap, elem in cls._OBJ_LIST_SPECS}
         return self
 
     def _view(self, ancestor):
-        """This object's memory viewed as `ancestor`'s dtype (what a method defined in
-        `ancestor` expects as self_row)."""
+        """This object's memory viewed as `ancestor`'s dtype (a 1-element array)."""
         v = self._views.get(ancestor)
         if v is None:
             v = np.frombuffer(self._mem, dtype=self._PROJ[ancestor], count=1)
             self._views[ancestor] = v
         return v
+
+    def _rec(self, ancestor):
+        """The record a JIT method defined in `ancestor` receives as `self` (a VIEW of this
+        object's memory: writes through it land in the row)."""
+        r = self._recs.get(ancestor)
+        if r is None:
+            r = self._view(ancestor)[0]
+            if _DEBUG:
+                r = _Rec(r)
+            self._recs[ancestor] = r
+        return r
 
     # --- pickle / deepcopy: addresses are meaningless in a new process, so rebuild
     # --- every pointer through the property setters (which recompute addresses).
@@ -1414,15 +1516,15 @@ class _ECSProxyMixin:
 
 
 # =====================================================================
-# 5. COMMAND LINE:  python ecs_compiler.py my_classes.py  ->  my_classes_compiled.py
+# 5. COMMAND LINE:  python hybrid_compiler.py my_classes.py  ->  my_classes_compiled.py
 # =====================================================================
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        sys.exit("usage: python ecs_compiler.py <source.py>")
+        sys.exit("usage: python hybrid_compiler.py <source.py>")
     src_path = sys.argv[1]
     out_path = src_path[:-3] + "_compiled.py"
     with open(src_path) as fh:
-        code = ECSCompiler().compile(fh.read())
+        code = HybridCompiler().compile(fh.read())
     with open(out_path, "w") as fh:
         fh.write(code)
     print(f"wrote {out_path}")
