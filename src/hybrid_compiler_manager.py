@@ -1,5 +1,5 @@
 """
-hybrid_compiler_manager.py -- build orchestration for a package of @c classes
+hybrid_compiler_manager.py -- build orchestration for a package of @compiled classes
 ==================================================================
 
 LAYOUT
@@ -7,9 +7,9 @@ LAYOUT
         __init__.py          <- the ONLY place you call the builder (see below)
         models/              <- your OOP source: any depth, any number of modules
             __init__.py
-            base.py          (contains @c classes)
-            tanks.py         (contains @c classes, may inherit from base.py's)
-            helpers.py       (no @c -> never scanned, stays ordinary Python)
+            base.py          (contains @compiled classes)
+            tanks.py         (contains @compiled classes, may inherit from base.py's)
+            helpers.py       (no @compiled -> never scanned, stays ordinary Python)
         compiled.py          <- GENERATED   (what you import at runtime)
         compiled.pyi         <- GENERATED   (IDE stub: re-exports your ORIGINAL classes)
 
@@ -22,7 +22,7 @@ LAYOUT
 
 WHAT build() DOES (runs when the package is first imported)
     1. scan   every .py under source_dir with the AST (no user code is imported) and keep
-              the modules that contain at least one @c class
+              the modules that contain at least one @compiled class
     2. hash   those files' contents + the compiler's own source -> compare with the hash
               stored in the first line of compiled.py
     3. if unchanged: do nothing (fast path, just reading + hashing a few files)
@@ -32,12 +32,12 @@ WHAT build() DOES (runs when the package is first imported)
        (with file and line) is raised from `import myproject`.
 
 THE MERGED NAMESPACE
-    All @c modules are compiled together, because classes inherit across modules and share
+    All @compiled modules are compiled together, because classes inherit across modules and share
     one type-id table.  Consequences:
       * `from .base import Entity` / `from myproject.models.base import Entity` between
-        @c modules are dropped (the names live in the merged module).
-      * `import myproject.models.base` (plain import of a @c module) is rejected.
-      * Imports of NON-@c modules (helpers.py, numpy, ...) are kept; relative ones are
+        @compiled modules are dropped (the names live in the merged module).
+      * `import myproject.models.base` (plain import of a @compiled module) is rejected.
+      * Imports of NON-@compiled modules (helpers.py, numpy, ...) are kept; relative ones are
         rewritten to absolute because compiled.py lives in a different package level.
       * Top-level class/function names must be unique across the scanned modules.
 """
@@ -95,7 +95,7 @@ class HybridCompilerManager:
         """Compile if anything changed.  Returns True if it (re)compiled."""
         mods = self.scan()
         if not mods:
-            warnings.warn(f"hybrid: no @c classes found under {self.src_dir}; nothing compiled")
+            warnings.warn(f"hybrid: no @compiled classes found under {self.src_dir}; nothing compiled")
             return False
         digest = self.digest(mods)
         if not force and self.out_py.exists() and self.out_pyi.exists() and self.stored_digest() == digest:
@@ -149,7 +149,7 @@ class HybridCompilerManager:
     # step 2: change detection
     # ------------------------------------------------------------------
     def digest(self, mods: list[SourceModule]) -> str:
-        """Hash of every @c source file (path + content) and of the compiler itself, so
+        """Hash of every @compiled source file (path + content) and of the compiler itself, so
         upgrading the compiler also triggers a rebuild."""
         h = hashlib.sha256()
         h.update(Path(hybrid_compiler.__file__).read_bytes())
@@ -210,7 +210,7 @@ class HybridCompilerManager:
         if isinstance(node, ast.Import):
             for a in node.names:
                 if a.name in compiled:
-                    raise CompileError(f"{m.path}:{node.lineno}: 'import {a.name}' of another @c module is not "
+                    raise CompileError(f"{m.path}:{node.lineno}: 'import {a.name}' of another @compiled module is not "
                                        f"supported; use 'from {a.name} import <names>'")
             return node
         if isinstance(node, ast.ImportFrom):
@@ -237,7 +237,7 @@ class HybridCompilerManager:
                 if isinstance(node, (ast.ClassDef, ast.FunctionDef)):
                     if node.name in owner:
                         raise CompileError(f"'{node.name}' is defined in both {owner[node.name]} and {m.path}; "
-                                           f"all @c modules share one namespace")
+                                           f"all @compiled modules share one namespace")
                     owner[node.name] = m.path
                 body.append(node)
         return HybridCompiler().compile_tree(ast.Module(body=body, type_ignores=[]))

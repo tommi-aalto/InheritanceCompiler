@@ -15,6 +15,8 @@ inheritance across otherwise separate root hierarchies
 super(), isinstance(object, Class), issubclass (object, Class)
 An override may append parameters after the parent's parameters when each appended
 parameter has a default. Parent parameter names, types, and order must be preserved.
+Inside `if isinstance(value, Child):`, calls on `value` use the narrowed child type,
+so child-only override parameters can be passed safely in that branch.
 
 When a class combines separate inheritance trees, the compiler creates an
 artificial squash root for those trees. Original class MROs are retained when

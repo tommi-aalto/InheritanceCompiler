@@ -6,10 +6,10 @@ WHAT THE USER WRITES
     Ordinary Python OOP (multiple inheritance, super(), polymorphism, numpy arrays).
         from hybrid_compiler import c       # marker decorator, does nothing at runtime
 
-        @c                                   # <- class is compiled
+        @compiled                                   # <- class is compiled
         class Entity:
             health: float                    # typed fields become numpy-dtype columns
-            @c                               # <- method is JIT-compiled (numba)
+            @compiled                               # <- method is JIT-compiled (numba)
             def take_damage(self, amount: float): ...
             def describe(self): ...          # undecorated -> stays plain Python
     Undecorated classes are copied through untouched.
@@ -60,8 +60,8 @@ DEBUG MODE
 RULES THE COMPILER ENFORCES
     1. JIT writes DATA, Python writes POINTERS.  JIT code may not re-point refs,
        assign lists / arrays, append to lists, or construct compiled objects.
-    2. A @c method may only call other @c methods (checked line by line).
-    3. A @c method may only touch typed fields (float/int/bool, compiled-class refs,
+    2. A @compiled method may only call other @compiled methods (checked line by line).
+    3. A @compiled method may only touch typed fields (float/int/bool, compiled-class refs,
        list[Class], np.ndarray[dtype, ndim]).  Strings/dicts etc. are Python-only
        "metadata" fields; touching one from JIT code is a compile error.
     4. An attribute name has ONE type across a class's MRO (Python has one slot per
@@ -73,7 +73,7 @@ RULES THE COMPILER ENFORCES
 
 KNOWN LIMITS / UNTESTED
     * Methods that return objects are not supported (return numbers/bools/None).
-    * Mutual recursion between @c methods may need explicit Numba signatures.
+    * Mutual recursion between @compiled methods may need explicit Numba signatures.
     * Numba-specific pieces (carray over a voidptr with a record dtype, records with
       explicit offsets, passing a record from carray(...)[0] to another njit function and
       mutating it) are written from documentation: run numba_smoke_test.py on a machine
@@ -160,7 +160,7 @@ class Field:
 
 @dataclass
 class Param:
-    """One parameter of a @c method (after `self`)."""
+    """One parameter of a @compiled method (after `self`)."""
     name: str
     kind: str                  # 'prim' | 'ent' | 'pass'  (pass = e.g. np.ndarray, handed through)
     ann: str                   # annotation text
@@ -354,9 +354,9 @@ class HybridCompiler:
     def _make_sig(self, cls: str, fn: ast.FunctionDef) -> list[Param]:
         a = fn.args
         if a.vararg or a.kwarg or a.kwonlyargs or a.posonlyargs:
-            raise CompileError(f"{cls}.{fn.name}: *args/**kwargs/keyword-only/positional-only params are not supported in @c methods")
+            raise CompileError(f"{cls}.{fn.name}: *args/**kwargs/keyword-only/positional-only params are not supported in @compiled methods")
         if not a.args or a.args[0].arg != "self":
-            raise CompileError(f"{cls}.{fn.name}: first parameter of a @c method must be named 'self'")
+            raise CompileError(f"{cls}.{fn.name}: first parameter of a @compiled method must be named 'self'")
         defaults = [None] * (len(a.args) - len(a.defaults)) + list(a.defaults)
         params = []
         for arg, dflt in zip(a.args[1:], defaults[1:]):
@@ -370,7 +370,7 @@ class HybridCompiler:
             else:
                 params.append(Param(arg.arg, "pass", ast.unparse(arg.annotation), default=dflt))
         if fn.returns is not None and self._ann_name(fn.returns) in self.class_names:
-            raise CompileError(f"{cls}.{fn.name}: returning compiled objects from @c methods is not supported")
+            raise CompileError(f"{cls}.{fn.name}: returning compiled objects from @compiled methods is not supported")
         return params
 
     def _parse_class(self, node: ast.ClassDef, tid: int):
@@ -378,7 +378,7 @@ class HybridCompiler:
             raise CompileError(f"{node.name}: class keywords/metaclasses are not supported")
         for d in node.decorator_list:
             if not _is_marked([d]):
-                raise CompileError(f"{node.name}: only the @c class decorator is supported")
+                raise CompileError(f"{node.name}: only the @compiled class decorator is supported")
         bases = []
         for b in node.bases:
             if isinstance(b, ast.Name) and b.id == "object":
@@ -386,7 +386,7 @@ class HybridCompiler:
             if isinstance(b, ast.Name) and b.id in self.class_names:
                 bases.append(b.id)
             else:
-                raise CompileError(f"{node.name}: compiled classes may only inherit from other @c classes, got {ast.unparse(b)}")
+                raise CompileError(f"{node.name}: compiled classes may only inherit from other @compiled classes, got {ast.unparse(b)}")
         info = ClassInfo(node.name, node, tid, bases)
         info.file = getattr(node, "_hybrid_file", "<source>")
 
@@ -412,9 +412,9 @@ class HybridCompiler:
                 info.consts[attr] = (f"CONST_{node.name}_{attr}", ast.unparse(item.value))
             elif isinstance(item, ast.FunctionDef) and _is_marked(item.decorator_list):
                 if item.name.startswith("__"):
-                    raise CompileError(f"{node.name}.{item.name}: dunder methods cannot be @c (keep __init__ plain Python)")
+                    raise CompileError(f"{node.name}.{item.name}: dunder methods cannot be @compiled (keep __init__ plain Python)")
                 if len(item.decorator_list) != 1:
-                    raise CompileError(f"{node.name}.{item.name}: a @c method cannot carry other decorators")
+                    raise CompileError(f"{node.name}.{item.name}: a @compiled method cannot carry other decorators")
                 info.jit_methods[item.name] = item
                 info.sigs[item.name] = self._make_sig(node.name, item)
             else:
@@ -610,7 +610,7 @@ class HybridCompiler:
     # step 7: emit the module
     # ------------------------------------------------------------------
     def _emit(self) -> str:
-        # --- lower every @c method first; this discovers which accessors/dispatchers must exist ---
+        # --- lower every @compiled method first; this discovers which accessors/dispatchers must exist ---
         jit_src: list[str] = []
         for cls, info in self.classes.items():
             for m, fn in info.jit_methods.items():
@@ -649,7 +649,7 @@ class HybridCompiler:
         out.append(_ANCESTRY_FUNCS)
 
         out.append(self._array_helpers())
-        out.append("# --- @c methods lowered to flat numba functions (self is a numpy record) " + "-" * 8)
+        out.append("# --- @compiled methods lowered to flat numba functions (self is a numpy record) " + "-" * 8)
         out.extend(jit_src)
         out.append("# --- generated accessor methods: field access through a pointer = a method call " + "-" * 3)
         out.extend(synth_src)
@@ -778,7 +778,7 @@ class HybridCompiler:
         for a in self.mro[x][1:]:
             if m in self.classes[a].jit_methods:
                 return self.classes[a].sigs[m]
-        raise CompileError(f"super().{m}() in {x}: no @c method '{m}' in any base class")
+        raise CompileError(f"super().{m}() in {x}: no @compiled method '{m}' in any base class")
 
     # ---- proxy classes --------------------------------------------------------
     def _prop_src(self, f: Field) -> str:
@@ -840,7 +840,7 @@ class HybridCompiler:
 
 
 # =====================================================================
-# 3. LOWERING OF ONE @c METHOD BODY  (OOP python -> flat numba python)
+# 3. LOWERING OF ONE @compiled METHOD BODY  (OOP python -> flat numba python)
 # =====================================================================
 class Lowerer(ast.NodeTransformer):
     """Rewrites one method body.
@@ -859,6 +859,7 @@ class Lowerer(ast.NodeTransformer):
         self.cls = cls
         self.method = method
         self.locals: dict[str, str] = {}      # local/param name -> static class (object-valued)
+        self.narrowed: dict[str, str] = {}
         self.tmp = 0
 
     # ---- small utilities ---------------------------------------------------
@@ -934,20 +935,19 @@ class Lowerer(ast.NodeTransformer):
     # ---- object-expression analysis ------------------------------------------
     def ptr(self, node) -> Optional[Ptr]:
         """If `node` evaluates to a compiled object (or None-able reference), describe it."""
+        ptr = None
         if isinstance(node, ast.Name):
             if node.id == "self":
-                return Ptr(self.cls, "self_type", "self_addr", True)
-            if node.id in self.locals:
-                return Ptr(self.locals[node.id], f"{node.id}_type", f"{node.id}_addr")
-            return None
-        if isinstance(node, ast.Attribute):
+                ptr = Ptr(self.cls, "self_type", "self_addr", True)
+            elif node.id in self.locals:
+                ptr = Ptr(self.locals[node.id], f"{node.id}_type", f"{node.id}_addr")
+        elif isinstance(node, ast.Attribute):
             owner = self.ptr(node.value)
             if owner is not None:
                 f = self.c.fields[owner.cls].get(node.attr)
                 if f is not None and f.kind == "ref":
-                    return Ptr(f.target, self.col(owner, f, f"{f.name}_type"), self.col(owner, f, f"{f.name}_addr"))
-            return None
-        if isinstance(node, ast.Subscript):
+                    ptr = Ptr(f.target, self.col(owner, f, f"{f.name}_type"), self.col(owner, f, f"{f.name}_addr"))
+        elif isinstance(node, ast.Subscript):
             lst = self.list_of(node.value)
             if lst is not None:
                 owner, f = lst
@@ -956,8 +956,13 @@ class Lowerer(ast.NodeTransformer):
                 arr = self.arr_src(owner, f)
                 cnt = self.col(owner, f, f"{f.name}_count")
                 i = f"_idx({self.src(node.slice)}, {cnt})"      # Python list indexing rules
-                return Ptr(f.target, f"{arr}[{i}, 0]", f"{arr}[{i}, 1]")
-        return None
+                ptr = Ptr(f.target, f"{arr}[{i}, 0]", f"{arr}[{i}, 1]")
+        if ptr is None:
+            return None
+        narrowed = self.narrowed.get(ast.dump(node, include_attributes=False))
+        if narrowed is not None:
+            return Ptr(narrowed, ptr.t, ptr.a, ptr.is_self and narrowed == self.cls)
+        return ptr
 
     def list_of(self, node) -> Optional[tuple[Ptr, Field]]:
         if isinstance(node, ast.Attribute):
@@ -979,7 +984,7 @@ class Lowerer(ast.NodeTransformer):
         if any(attr in self.c.classes[a].py_fields for a in self.c.mro[owner.cls]):
             why = "a python-only (metadata) field"
         else:
-            why = "not a declared typed field/constant (JIT code cannot use undeclared attributes or call non-@c methods)"
+            why = "not a declared typed field/constant (JIT code cannot use undeclared attributes or call non-@compiled methods)"
         return f"'{owner.cls}.{attr}' is {why}"
 
     # ---- fallbacks that catch objects used in unsupported positions ----------
@@ -1105,8 +1110,27 @@ class Lowerer(ast.NodeTransformer):
         return stmts
 
     def visit_If(self, node: ast.If):
+        narrowed_expr = None
+        narrowed_class = None
+        test = node.test
+        if (isinstance(test, ast.Call) and isinstance(test.func, ast.Name)
+                and test.func.id == "isinstance" and len(test.args) == 2
+                and isinstance(test.args[1], ast.Name) and test.args[1].id in self.c.classes):
+            narrowed_expr = ast.dump(test.args[0], include_attributes=False)
+            narrowed_class = test.args[1].id
+            ptr = self.ptr(test.args[0])
+            if ptr is not None:
+                if ptr.cls not in self.c.mro[narrowed_class]:
+                    if narrowed_class in self.c.mro[ptr.cls]:
+                        narrowed_expr = None
+                    else:
+                        self._err(test, f"isinstance target {narrowed_class} is not compatible with {ptr.cls}")
         node.test = self.truth(node.test)
+        previous_narrowing = self.narrowed
+        if narrowed_expr is not None:
+            self.narrowed = {**previous_narrowing, narrowed_expr: narrowed_class}
         node.body = self.block(node.body)
+        self.narrowed = previous_narrowing
         node.orelse = self.block(node.orelse) if node.orelse else []
         return node
 
@@ -1236,7 +1260,7 @@ class Lowerer(ast.NodeTransformer):
             if owner is not None:
                 m = f.attr
                 if self.c.find_method(owner.cls, m) is None:
-                    self._err(node, f"'{owner.cls}.{m}' is not a @c method; JIT methods may only call other @c methods")
+                    self._err(node, f"'{owner.cls}.{m}' is not a @compiled method; JIT methods may only call other @compiled methods")
                 self.c.need_dispatch.add((owner.cls, m))
                 args = self._expand(node, self._bind(node, self.c.sig_of(owner.cls, m), f"{owner.cls}.{m}"))
                 return ast.Call(func=ast.Name(id=f"dispatch_{owner.cls}_{m}", ctx=ast.Load()),

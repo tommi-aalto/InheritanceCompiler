@@ -1,7 +1,7 @@
-from example_modules import Paladin, Sword, Magical
+from example_modules import Paladin, Bow, Magical
 
 target = Magical()
-weapon = Sword(sharpness=10)
+weapon = Bow(arrow_sizes=[13,14,15,16,17])
 paladin = Paladin(weapon)
 paladin.strike(target)
 print(target.health)

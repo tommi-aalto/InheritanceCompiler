@@ -162,30 +162,50 @@ def test_subclass_without_new_fields():
 
 
 def test_override_extends_parent_signature():
-    """A parent-typed call dispatches to an override with defaulted child-only arguments."""
-    src = ("from hybrid_compiler import c\n"
-           "@c\nclass A:\n"
+    """isinstance narrows the receiver so a guarded call can pass child-only arguments."""
+    src = ("from hybrid_compiler import compiled\n"
+           "@compiled\nclass A:\n"
            "    total: int\n"
-           "    @c\n"
+           "    @compiled\n"
            "    def hit(self, amount: int) -> None:\n"
            "        self.total += amount\n"
-           "    @c\n"
-           "    def invoke(self, target: A, amount: int) -> None:\n"
-           "        target.hit(amount)\n"
-           "@c\nclass B(A):\n"
-           "    @c\n"
+           "@compiled\nclass B(A):\n"
+           "    @compiled\n"
            "    def hit(self, amount: int, bonus: int = 3) -> None:\n"
            "        super().hit(amount + bonus)\n")
+    src += ("@compiled\nclass Holder:\n"
+            "    target: A\n"
+            "    @compiled\n"
+            "    def invoke(self, amount: int) -> None:\n"
+            "        if isinstance(self.target, B):\n"
+            "            self.target.hit(amount, bonus=4)\n"
+            "        else:\n"
+            "            self.target.hit(amount)\n")
     compiled = HybridCompiler().compile(src)
-    assert "return B__hit(" in compiled
-    assert "self_addr, amount, 3)" in compiled
+    assert "dispatch_B_hit" in compiled
+    unguarded_src = src.replace(
+        "if isinstance(self.target, B):\n"
+        "            self.target.hit(amount, bonus=4)\n"
+        "        else:\n"
+        "            self.target.hit(amount)",
+        "self.target.hit(amount, bonus=4)")
+    try:
+        HybridCompiler().compile(unguarded_src)
+    except CompileError as error:
+        assert "no parameter 'bonus'" in str(error)
+    else:
+        raise AssertionError("child-only arguments must require an isinstance guard")
     m = load(compiled, "_compiled_extended_override")
     b = m.B()
-    m.A().invoke(b, 5)
-    assert b.total == 8
+    holder = m.Holder(); holder.target = b
+    holder.invoke(5)
+    assert b.total == 9
+    holder.target = m.A()
+    holder.invoke(5)
+    assert holder.target.total == 5
     b.hit(2, bonus=4)
-    assert b.total == 14
-    print("ok  virtual parent calls and direct child calls support appended defaults")
+    assert b.total == 15
+    print("ok  isinstance narrows an object field for child-only override arguments")
 
 
 def test_init_resolution():
